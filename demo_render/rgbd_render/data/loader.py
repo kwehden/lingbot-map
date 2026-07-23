@@ -91,18 +91,17 @@ def _parse_raw_data(data: Dict[str, np.ndarray]) -> Dict:
         K_raw = np.tile(K_raw[None], (len(images), 1, 1))
 
     if 'extrinsic' not in data:
-        raise ValueError("NPZ must contain 'extrinsic' (W2C poses).")
+        raise ValueError("NPZ must contain 'extrinsic' (camera-to-world poses).")
     ext = data['extrinsic'].astype(np.float32)
     nf = ext.shape[0]
-    w2c = np.zeros((nf, 4, 4), dtype=np.float32)
-    w2c[:, :3, :] = ext[:, :3, :]
-    w2c[:, 3, 3] = 1.0
-    R = w2c[:, :3, :3]
-    t = w2c[:, :3, 3:4]
-    Rt = R.transpose(0, 2, 1)
+    # `extrinsic` is already camera-to-world (c2w): the producer
+    # (demo.py::postprocess) explicitly converts the model's raw w2c pose
+    # encoding to c2w before writing it to the NPZ. Pad the stored 3x4 into
+    # a 4x4 directly — do NOT invert again here (a prior version of this
+    # function assumed `extrinsic` was still w2c and re-inverted it, which
+    # silently double-inverted an already-c2w matrix).
     c2w = np.zeros((nf, 4, 4), dtype=np.float32)
-    c2w[:, :3, :3] = Rt
-    c2w[:, :3, 3:4] = -Rt @ t
+    c2w[:, :3, :] = ext[:, :3, :]
     c2w[:, 3, 3] = 1.0
 
     confidence = None
