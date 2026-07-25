@@ -592,6 +592,16 @@ def build_overlays(cfg, scene):
             box_overlay = BoxOverlay(fixtures, frame_mapper,
                                      line_width=ov.box_line_width)
             overlays.append(box_overlay)
+            specs.append({'type': 'box',
+                          'fixtures': box_overlay.fixtures,
+                          'line_width': ov.box_line_width,
+                          'category_colors': box_overlay.category_colors,
+                          'frame_mapper': None if frame_mapper is None else {
+                              'render_src_fps': frame_mapper.render_src_fps,
+                              'render_frame_interval': frame_mapper.render_frame_interval,
+                              'analyze_src_fps': frame_mapper.analyze_src_fps,
+                              'analyze_frame_interval': frame_mapper.analyze_frame_interval,
+                          }})
     elif show_labels:
         print("[warn] --show_labels has no effect without --boxes_json; "
               "no box overlay to label")

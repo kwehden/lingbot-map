@@ -30,7 +30,9 @@ from tqdm import tqdm
 
 from ..camera import CameraPath
 from ..config import PipelineConfig, RenderConfig
-from ..overlay import Overlay, CameraOverlay, stamp_frame_tag, TrailStyle, HeadStyle, preset_styles, parse_color
+from ..overlay import (Overlay, CameraOverlay, BoxOverlay, FrameIndexMapper,
+                       stamp_frame_tag, stamp_fixture_labels, TrailStyle,
+                       HeadStyle, preset_styles, parse_color)
 from ..renderer import Open3DRenderer, silence_process_stdio
 from ..scene import Scene
 
@@ -80,12 +82,23 @@ def _worker_fn_inner(job_queue, done_counter, init_args):
                 c2w_poses, intrinsics=init_args.get('intrinsics'),
                 images=init_args.get('images_thumb'),
                 trail=base_trail, head=base_head))
+        elif od['type'] == 'box':
+            fm = od.get('frame_mapper')
+            frame_mapper = None if fm is None else FrameIndexMapper(
+                fm['render_src_fps'], fm['render_frame_interval'],
+                fm['analyze_src_fps'], fm['analyze_frame_interval'])
+            overlays.append(BoxOverlay(
+                od['fixtures'], frame_mapper,
+                line_width=od.get('line_width', 2.0),
+                category_colors=od.get('category_colors')))
 
     renderer = Open3DRenderer(config)
     output_dir = init_args['output_dir']
     do_tag = init_args.get('frame_tag', False)
     tag_pos = init_args.get('frame_tag_position', 'top_left')
     total_frames = init_args.get('total_frames', 0)
+    box_overlay = next((o for o in overlays if isinstance(o, BoxOverlay)), None)
+    do_labels = init_args.get('show_labels', False) and box_overlay is not None
 
     while True:
         try:
@@ -123,6 +136,8 @@ def _worker_fn_inner(job_queue, done_counter, init_args):
 
         if do_tag:
             stamp_frame_tag(img, frame_idx, total_frames, tag_pos)
+        if do_labels:
+            stamp_fixture_labels(img, camera, box_overlay.visible_fixtures(frame_idx))
         cv2.imwrite(os.path.join(output_dir, f'frame_{frame_idx:06d}.png'),
                     cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
 
@@ -184,6 +199,7 @@ def run_parallel(scene: Scene, camera_path: CameraPath,
         'overlay_specs': overlay_specs,
         'frame_tag': config.overlay.frame_tag,
         'frame_tag_position': config.overlay.frame_tag_position,
+        'show_labels': config.overlay.show_labels,
         'total_frames': S,
     }
 
