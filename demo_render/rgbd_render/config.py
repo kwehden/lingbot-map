@@ -152,6 +152,13 @@ class PipelineConfig:
     frame_stride: int = 1         # 1 = every frame, N = every N-th frame
     hd_image_folder: str = ''     # folder with original high-res frames for RGB video
 
+    # Observed source-video sampling for THIS render job's own frame
+    # extraction (measured in load_images_from_video, else None for
+    # image-folder input). Threaded into BoxOverlay's FrameIndexMapper so
+    # visibility windows are remapped by timestamp, not raw index (REQ-015).
+    observed_src_fps: Optional[float] = None
+    observed_frame_interval: Optional[int] = None
+
     scene: SceneConfig = field(default_factory=SceneConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)

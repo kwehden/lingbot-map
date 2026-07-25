@@ -265,6 +265,12 @@ def load_images_from_video(video_path, fps=None, target_frames=None,
     ``apply_image_filters`` semantics for image-folder input).  Cached / saved
     PNG frames are always the unstrided fps-extracted ones so the cache is
     reusable across different stride settings.
+
+    Returns ``(images, observed)`` where ``observed`` is
+    ``{'src_fps': float, 'frame_interval': int}`` capturing this job's own
+    frame-sampling parameters (REQ-015 / DC-2), or ``{'src_fps': None,
+    'frame_interval': None}`` when frames came from cache (no decode happened,
+    so the source rate is unknown here).
     """
     stride = max(1, int(stride))
 
@@ -283,7 +289,10 @@ def load_images_from_video(video_path, fps=None, target_frames=None,
             )
             h, w = images.shape[-2:]
             print(f"Preprocessed to {w}x{h} ({len(images)} frames)")
-            return images
+            # Frames came from cache: no decode, so the source rate is unknown
+            # here. FrameIndexMapper falls back to identity mapping in this
+            # case, matching v1's same-sampling assumption.
+            return images, {'src_fps': None, 'frame_interval': None}
 
     # Decode video
     cap = cv2.VideoCapture(video_path)
@@ -356,7 +365,7 @@ def load_images_from_video(video_path, fps=None, target_frames=None,
         print(f"Applied stride={stride}: {collected} -> {len(images)} frames")
     h, w = images.shape[-2:]
     print(f"Preprocessed to {w}x{h} ({len(images)} frames)")
-    return images
+    return images, {'src_fps': float(src_fps), 'frame_interval': int(interval)}
 
 
 def load_images_from_paths(paths, image_size=518, patch_size=14, num_workers=8):
@@ -765,7 +774,7 @@ def render_with_pipeline(npz_path, output_video, args, artifact_name=None):
         _set_nested,
     )
     from rgbd_render.camera import build_camera_path
-    from rgbd_render.overlay import build_overlays
+    from rgbd_render.overlay import build_overlays, BoxOverlay
     from rgbd_render.pipeline.builder import SceneBuilder
     from rgbd_render.pipeline.offline import OfflinePipeline
 
@@ -895,6 +904,18 @@ def render_with_pipeline(npz_path, output_video, args, artifact_name=None):
     if getattr(args, 'frame_tag_position', None):
         cfg.overlay.frame_tag_position = args.frame_tag_position
 
+    # Fixture box overlay (opt-in). boxes_json is passed straight to
+    # json.load() inside build_overlays — no shell/subprocess interpolation
+    # (SEC-1), same as every other --*_path flag here.
+    if getattr(args, 'boxes_json', None):
+        cfg.overlay.boxes_json = args.boxes_json
+    cfg.overlay.show_labels = bool(getattr(args, 'show_labels', False))
+
+    # This render job's own observed source-video sampling (REQ-015), threaded
+    # into BoxOverlay's FrameIndexMapper by build_overlays().
+    cfg.observed_src_fps = getattr(args, 'observed_src_fps', None)
+    cfg.observed_frame_interval = getattr(args, 'observed_frame_interval', None)
+
     scene = SceneBuilder(cfg, log=_log).load().preprocess().voxelize().build()
     camera_path = build_camera_path(cfg.camera, scene)
     overlays, overlay_specs = build_overlays(cfg, scene)
@@ -904,6 +925,13 @@ def render_with_pipeline(npz_path, output_video, args, artifact_name=None):
 
     OfflinePipeline(scene, camera_path, overlays, cfg,
                     overlay_specs=overlay_specs, log=_log).run()
+
+    # OBS-2: per-run box summary once at pipeline end.
+    for ov in overlays:
+        if isinstance(ov, BoxOverlay):
+            _log(f"[boxes] {ov.n_rendered} fixtures rendered with boxes, "
+                 f"{ov.n_skipped} skipped (malformed)")
+
     scene.destroy()
     return True
 
@@ -1232,6 +1260,12 @@ Examples:
     parser.add_argument("--frame_tag_position", type=str, default=None,
                         choices=["top_left", "top_right", "bottom_left", "bottom_right"],
                         help="Frame counter position (only with --frame_tag)")
+    parser.add_argument("--boxes_json", type=str, default=None,
+                        help="Path to a fixtures-visibility JSON (DC-2 schema). "
+                             "If unset, box overlay is disabled.")
+    parser.add_argument("--show_labels", action="store_true",
+                        help="Draw each visible box's category label as 2D text "
+                             "(requires --boxes_json; no-op with a warning otherwise)")
     parser.add_argument("--video_fps", type=int, default=30)
     parser.add_argument("--video_width", type=int, default=1920)
     parser.add_argument("--video_height", type=int, default=1080)
@@ -1302,7 +1336,7 @@ def _discover_scenes(args, parser, video_images=None):
         save_frames_dir = args.save_frames_dir
         if save_frames_dir is None:
             save_frames_dir = os.path.join(args.output_folder, f"{video_name}_frames")
-        video_images = load_images_from_video(
+        video_images, observed = load_images_from_video(
             args.video_path,
             fps=args.fps,
             target_frames=args.target_frames,
@@ -1312,6 +1346,11 @@ def _discover_scenes(args, parser, video_images=None):
             first_k=args.first_k,
             stride=args.image_stride,
         )
+        # Stash this render job's own observed frame sampling so
+        # render_with_pipeline() can thread it into BoxOverlay's
+        # FrameIndexMapper (REQ-015 timestamp remapping).
+        args.observed_src_fps = observed['src_fps']
+        args.observed_frame_interval = observed['frame_interval']
         scenes = [(video_name, args.output_folder, video_images.shape[0])]
     else:
         if not os.path.isdir(args.input_folder):

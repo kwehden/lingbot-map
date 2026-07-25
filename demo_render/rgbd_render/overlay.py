@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import colorsys
 import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -378,6 +379,41 @@ _BOX_EDGES = np.array([
 ], dtype=np.int32)
 
 
+class FrameIndexMapper:
+    """Converts a render-job frame index into the analyze job's frame-index
+    space via timestamp equivalence, so visibility windows computed by the
+    analyze job apply correctly even when the two jobs sampled the source
+    video at different rates (REQ-015).
+
+        timestamp_seconds     = render_frame_idx * render_frame_interval / render_src_fps
+        analyze_frame_idx_equiv = round(timestamp_seconds * analyze_src_fps / analyze_frame_interval)
+
+    When the two jobs' sampling parameters match (today's common case) this
+    reduces algebraically to ``analyze_frame_idx_equiv == render_frame_idx``,
+    i.e. an exact no-op — but it stops silently trusting index equality the
+    moment either side's ``src_fps``/``frame_interval`` diverges.
+    """
+
+    def __init__(self, render_src_fps: float, render_frame_interval: float,
+                 analyze_src_fps: float, analyze_frame_interval: float):
+        self.render_src_fps = float(render_src_fps)
+        self.render_frame_interval = float(render_frame_interval)
+        self.analyze_src_fps = float(analyze_src_fps)
+        self.analyze_frame_interval = float(analyze_frame_interval)
+
+    def map(self, render_frame_idx: int) -> int:
+        """Return the analyze-frame-space index equivalent to this render
+        frame. Always an int: the formula is well-defined for any
+        ``render_frame_idx >= 0`` and any analyze index that lands outside a
+        fixture's ``[first_frame, last_frame]`` window is simply filtered out
+        by ``BoxOverlay.visible_fixtures`` — so there is no separate
+        out-of-range sentinel to return here."""
+        timestamp_seconds = (render_frame_idx * self.render_frame_interval
+                             / self.render_src_fps)
+        return round(timestamp_seconds * self.analyze_src_fps
+                     / self.analyze_frame_interval)
+
+
 class BoxOverlay(Overlay):
     """Draws fixture 3D bounding boxes as batched LineSet edges, filtered by
     each fixture's frame-visibility window (remapped into this render job's
@@ -403,6 +439,10 @@ class BoxOverlay(Overlay):
         self.frame_mapper = frame_mapper
         self.line_width = line_width
         self.fixtures = self._validate_fixtures(fixtures)
+        # OBS-2 per-run tally: fixtures that survived validation (rendered
+        # whenever their window is active) vs. dropped as malformed.
+        self.n_rendered = len(self.fixtures)
+        self.n_skipped = len(fixtures) - len(self.fixtures)
 
         if category_colors is None:
             category_colors = {}
@@ -537,7 +577,46 @@ def build_overlays(cfg, scene):
                           'head_texture_alpha': ov.head_texture_alpha,
                       }})
 
+    boxes_json = getattr(ov, 'boxes_json', None)
+    show_labels = getattr(ov, 'show_labels', False)
+    if boxes_json:
+        try:
+            with open(boxes_json) as f:
+                doc = json.load(f)
+        except Exception as e:
+            print(f"[warn] --boxes_json {boxes_json} could not be read ({e}); "
+                  f"rendering without box overlay")
+        else:
+            fixtures = doc.get('fixtures', [])
+            frame_mapper = _build_frame_mapper(cfg, doc.get('analyze_frame_sampling'))
+            box_overlay = BoxOverlay(fixtures, frame_mapper,
+                                     line_width=ov.box_line_width)
+            overlays.append(box_overlay)
+    elif show_labels:
+        print("[warn] --show_labels has no effect without --boxes_json; "
+              "no box overlay to label")
+
     return overlays, specs
+
+
+def _build_frame_mapper(cfg, analyze_sampling):
+    """Build a FrameIndexMapper from the render job's observed sampling
+    (``cfg.observed_src_fps``/``cfg.observed_frame_interval``) and the DC-2
+    artifact's ``analyze_frame_sampling`` block. Returns ``None`` (identity
+    mapping) when any of the four values is missing — the safe v1 fallback
+    when either side didn't record real sampling metadata (e.g. image-folder
+    input, or a legacy analyze run with sentinel values)."""
+    if not analyze_sampling:
+        return None
+    render_src_fps = getattr(cfg, 'observed_src_fps', None)
+    render_interval = getattr(cfg, 'observed_frame_interval', None)
+    analyze_src_fps = analyze_sampling.get('src_fps')
+    analyze_interval = analyze_sampling.get('frame_interval')
+    values = (render_src_fps, render_interval, analyze_src_fps, analyze_interval)
+    if any(v is None for v in values) or render_src_fps == 0 or analyze_interval == 0:
+        return None
+    return FrameIndexMapper(render_src_fps, render_interval,
+                            analyze_src_fps, analyze_interval)
 
 
 def preset_styles(preset: str):
@@ -582,6 +661,31 @@ def project_point_to_screen(point_world: np.ndarray, camera: Camera,
     if not (0 <= px < render_w and 0 <= py < render_h):
         return None
     return float(px), float(py)
+
+
+def stamp_fixture_labels(image: np.ndarray, camera: Camera,
+                         visible_fixtures: List[dict],
+                         font_scale: float = 0.5) -> np.ndarray:
+    """For each visible fixture, project its centroid (mean of bbox_min/
+    bbox_max) to screen space; if the projection succeeds (on-frame, in front
+    of camera), draw its ``category`` text via cv2.putText at that position
+    (same outline+fill style as stamp_frame_tag). If projection fails, skip
+    that fixture's label entirely for this frame (REQ-016b) — never clamp to
+    an edge position. Modifies ``image`` in place, returns it."""
+    render_h, render_w = image.shape[:2]
+    for fx in visible_fixtures:
+        centroid = (np.asarray(fx['bbox_min'], dtype=np.float64)
+                    + np.asarray(fx['bbox_max'], dtype=np.float64)) / 2.0
+        pos = project_point_to_screen(centroid, camera, render_w, render_h)
+        if pos is None:
+            continue
+        px, py = int(pos[0]), int(pos[1])
+        text = fx['category']
+        cv2.putText(image, text, (px, py), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (0, 0, 0), 3, cv2.LINE_AA)       # outline
+        cv2.putText(image, text, (px, py), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (255, 255, 255), 1, cv2.LINE_AA)  # fill
+    return image
 
 
 # ---------------------------------------------------------------------------
