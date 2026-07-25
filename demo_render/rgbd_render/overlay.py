@@ -7,6 +7,7 @@ to each rendered frame. The dict-based geometry format is consumed by Open3DRend
 from __future__ import annotations
 
 import colorsys
+import hashlib
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -102,6 +103,58 @@ def parse_color(s: str) -> List[float]:
             return [int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
     raise ValueError(f"Cannot parse color: {s!r}. "
                      f"Use '#RRGGBB', '#RGB', or a name like 'black', 'white', 'r', 'g'.")
+
+
+# ---------------------------------------------------------------------------
+# Fixture category colors (ported from analytics/vocabulary.py)
+#
+# The analyze side lives in a separate repo whose Python module cannot be
+# imported here, so the SHA-1-seeded HSL kernel is re-derived directly rather
+# than duplicating a hand-picked palette. Same (category name, group) input
+# yields the same bytes as vocabulary.py's class_color() — keep in lockstep.
+# ---------------------------------------------------------------------------
+
+_GROUP_HUE = {
+    "none": 0.0,
+    "lighting": 0.13,
+    "mep": 0.52,
+    "architectural": 0.62,
+    "furniture": 0.08,
+    "waste": 0.30,
+    "safety": 0.0,
+    "mining": 0.90,
+    "farm": 0.25,
+    "port": 0.58,
+    "desert": 0.07,
+    "vlm": 0.75,
+    "other": 0.75,
+}
+
+_HUE_JITTER = 0.08
+_SAT_RANGE = (0.65, 1.00)
+_LIGHT_RANGE = (0.42, 0.70)
+_UNLABELED_RGB = (128, 128, 128)
+
+
+def _hash_unit(name: str, salt: str) -> float:
+    """Deterministic value in [0, 1) from (salt, name) via SHA-1."""
+    digest = hashlib.sha1((salt + name).encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) / 0xFFFFFFFF
+
+
+def category_color(name: str, group: str) -> tuple:
+    """Deterministic RGB (0-1 floats) for a fixture category, matching
+    analytics/vocabulary.py's class_color() up to the 0-255 rounding it does
+    at the end (this returns unrounded 0-1 floats for the renderer's LineSet
+    color arrays). name 'unlabeled' is always neutral gray."""
+    if name == "unlabeled":
+        r, g, b = _UNLABELED_RGB
+        return (r / 255.0, g / 255.0, b / 255.0)
+    base_hue = _GROUP_HUE.get(group, _GROUP_HUE["other"])
+    hue = (base_hue + (_hash_unit(name, "hue") - 0.5) * _HUE_JITTER) % 1.0
+    sat = _SAT_RANGE[0] + _hash_unit(name, "sat") * (_SAT_RANGE[1] - _SAT_RANGE[0])
+    light = _LIGHT_RANGE[0] + _hash_unit(name, "light") * (_LIGHT_RANGE[1] - _LIGHT_RANGE[0])
+    return colorsys.hls_to_rgb(hue, light, sat)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +353,146 @@ class CameraOverlay(Overlay):
                    trail=final_trail, head=final_head)
 
 
+# ---------------------------------------------------------------------------
+# BoxOverlay
+# ---------------------------------------------------------------------------
+
+# Unit-cube corners (min=0, max=1 per axis) and the 12 edges connecting them.
+# Same 8-point/edge-list topology as CameraOverlay._build_head_frustums(),
+# generalized from a 5-point pyramid to an 8-point axis-aligned box.
+_BOX_UNIT_CORNERS = np.array([
+    [0, 0, 0],   # 0
+    [1, 0, 0],   # 1
+    [1, 1, 0],   # 2
+    [0, 1, 0],   # 3
+    [0, 0, 1],   # 4
+    [1, 0, 1],   # 5
+    [1, 1, 1],   # 6
+    [0, 1, 1],   # 7
+], dtype=np.float64)
+
+_BOX_EDGES = np.array([
+    [0, 1], [1, 2], [2, 3], [3, 0],   # bottom face
+    [4, 5], [5, 6], [6, 7], [7, 4],   # top face
+    [0, 4], [1, 5], [2, 6], [3, 7],   # vertical edges
+], dtype=np.int32)
+
+
+class BoxOverlay(Overlay):
+    """Draws fixture 3D bounding boxes as batched LineSet edges, filtered by
+    each fixture's frame-visibility window (remapped into this render job's
+    own frame-index space via the frame_mapper)."""
+
+    def __init__(self, fixtures: List[dict], frame_mapper,
+                 line_width: float = 2.0, category_colors: Optional[dict] = None):
+        """
+        Args:
+            fixtures: parsed DC-2 JSON ``fixtures`` list — each dict has
+                bbox_min (3), bbox_max (3), category, group, first_frame,
+                last_frame, frames_seen (optional).
+            frame_mapper: maps this render job's frame_idx -> the analyze
+                job's frame-index space via ``.map(frame_idx) -> int | None``
+                (None when the render frame has no analyze-space equivalent).
+                ``None`` here means identity mapping (render idx == analyze
+                idx), the v1 same-sampling case.
+            line_width: LineSet edge width.
+            category_colors: optional {category: (r, g, b) 0-1} override;
+                defaults to analytics/vocabulary.json's color logic
+                (re-derived at construction time — see ``category_color``).
+        """
+        self.frame_mapper = frame_mapper
+        self.line_width = line_width
+        self.fixtures = self._validate_fixtures(fixtures)
+
+        if category_colors is None:
+            category_colors = {}
+            for f in self.fixtures:
+                cat = f['category']
+                if cat not in category_colors:
+                    category_colors[cat] = category_color(cat, f.get('group', 'other'))
+        self.category_colors = category_colors
+
+    @staticmethod
+    def _validate_fixtures(fixtures: List[dict]) -> List[dict]:
+        """Drop fixtures missing required geometry/label/window fields, warning
+        on each skip (feeds TASK-017's rendered/skipped tally). Fixtures with
+        only ``frames_seen`` get first_frame/last_frame derived from it."""
+        cleaned = []
+        for f in fixtures:
+            fid = f.get('id', '?')
+            missing = next((field_name for field_name in ('bbox_min', 'bbox_max', 'category')
+                            if f.get(field_name) is None), None)
+            if missing is not None:
+                print(f"[warn] Skipping fixture id={fid}: missing required field {missing}")
+                continue
+
+            first = f.get('first_frame')
+            last = f.get('last_frame')
+            if first is None or last is None:
+                seen = f.get('frames_seen')
+                if not seen:
+                    print(f"[warn] Skipping fixture id={fid}: missing required field "
+                          f"first_frame/last_frame or frames_seen")
+                    continue
+                first, last = min(seen), max(seen)
+
+            if first > last:
+                print(f"[warn] Skipping fixture id={fid}: malformed window "
+                      f"first_frame={first} > last_frame={last}")
+                continue
+
+            entry = dict(f)
+            entry['first_frame'] = first
+            entry['last_frame'] = last
+            cleaned.append(entry)
+        return cleaned
+
+    def visible_fixtures(self, frame_idx: int) -> List[dict]:
+        """Fixtures whose [first_frame, last_frame] window covers this render
+        frame (after remapping into analyze-frame space). Also consumed by the
+        label-stamping step so box and label visibility can never disagree."""
+        if self.frame_mapper is None:
+            analyze_idx = frame_idx
+        else:
+            analyze_idx = self.frame_mapper.map(frame_idx)
+            if analyze_idx is None:
+                return []
+        return [f for f in self.fixtures
+                if f['first_frame'] <= analyze_idx <= f['last_frame']]
+
+    def apply(self, scene, camera, frame_idx, vis_xyz, vis_rgb, vis_frames):
+        visible = self.visible_fixtures(frame_idx)
+        if not visible:
+            return vis_xyz, vis_rgb, []
+        return vis_xyz, vis_rgb, [self._build_boxes(visible)]
+
+    def _build_boxes(self, visible: List[dict]) -> dict:
+        n = len(visible)
+        points = np.empty((8 * n, 3), dtype=np.float64)
+        segments = np.empty((12 * n, 2), dtype=np.int32)
+        colors = np.empty((12 * n, 3), dtype=np.float64)
+
+        for k, f in enumerate(visible):
+            bmin = np.asarray(f['bbox_min'], dtype=np.float64)
+            bmax = np.asarray(f['bbox_max'], dtype=np.float64)
+            points[8 * k:8 * k + 8] = bmin + _BOX_UNIT_CORNERS * (bmax - bmin)
+            segments[12 * k:12 * k + 12] = _BOX_EDGES + 8 * k
+            cat = f['category']
+            color = self.category_colors.get(cat)
+            if color is None:
+                color = category_color(cat, f.get('group', 'other'))
+            colors[12 * k:12 * k + 12] = color
+
+        return {
+            'type': 'lines',
+            'name': 'fixture_boxes',
+            'points': points,
+            'segments': segments,
+            'colors': colors,
+            'line_width': self.line_width,
+        }
+
+
 def build_overlays(cfg, scene):
     """Build overlay instances + serializable specs from config.
 
@@ -362,6 +555,33 @@ def preset_styles(preset: str):
     else:
         raise ValueError(f"Unknown camera_vis preset: {preset!r}. "
                          f"Choose from: default, frustum, textured, trail")
+
+
+# ---------------------------------------------------------------------------
+# 2D projection (post-processing, not a 3D overlay)
+# ---------------------------------------------------------------------------
+
+def project_point_to_screen(point_world: np.ndarray, camera: Camera,
+                            render_w: int, render_h: int):
+    """Pinhole-project one 3D world point to 2D screen pixels, using the same
+    camera model the renderer's own unprojection/culling uses
+    (Camera.w2c() + Camera.fov_intrinsics()).
+
+    Returns (px, py) if the point is in front of the camera (z > 0 in camera
+    space) and within [0, render_w) x [0, render_h) — else None (off-frame or
+    behind camera; never clamped to an edge).
+    """
+    w2c = camera.w2c()
+    fx, fy, cx, cy = camera.fov_intrinsics(render_w, render_h)
+    p_h = np.append(point_world, 1.0)
+    p_cam = w2c @ p_h
+    if p_cam[2] <= 1e-6:
+        return None
+    px = p_cam[0] * fx / p_cam[2] + cx
+    py = p_cam[1] * fy / p_cam[2] + cy
+    if not (0 <= px < render_w and 0 <= py < render_h):
+        return None
+    return float(px), float(py)
 
 
 # ---------------------------------------------------------------------------

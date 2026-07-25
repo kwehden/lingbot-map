@@ -127,6 +127,12 @@ class OverlayConfig:
     frame_tag: bool = False
     frame_tag_position: str = 'top_left'
 
+    # Fixture box overlay
+    boxes_json: Optional[str] = None
+    show_labels: bool = False
+    box_line_width: float = 2.0
+    label_font_scale: float = 0.5
+
 
 @dataclass
 class GpuConfig:
@@ -255,6 +261,8 @@ class PipelineConfig:
             'head_texture_alpha': 'overlay.head_texture_alpha',
             'frame_tag': 'overlay.frame_tag',
             'frame_tag_position': 'overlay.frame_tag_position',
+            'boxes_json': 'overlay.boxes_json',
+            'show_labels': 'overlay.show_labels',
         }
 
         # Apply dotted args first (e.g. --scene.voxel_size 0.005)
