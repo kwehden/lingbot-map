@@ -174,21 +174,23 @@ class Open3DRenderer:
             camera.eye.astype(np.float64),
             camera.up.astype(np.float64))
 
-        # EDL: clear stale overlays, grab point-cloud-only depth,
-        # then add current overlays
-        edl_depth = None
-        if self.config.edl:
+        # Capture a point-cloud-only depth buffer when EITHER EDL shading or
+        # the box_depth_test 2D-compositing fallback needs it: clear stale
+        # overlays, grab depth, then re-add current overlays. Returned to the
+        # caller so the pipeline's box compositor can depth-test edges.
+        pcd_depth = None
+        if self.config.edl or self.config.box_depth_test:
             self._update_extra_geoms([])
-            edl_depth = np.asarray(
+            pcd_depth = np.asarray(
                 self._renderer.render_to_depth_image(z_in_view_space=True)
             ).astype(np.float32)
 
         self._update_extra_geoms(extra_geoms)
 
-        return self._render_and_postprocess(edl_depth)
+        return self._render_and_postprocess(pcd_depth), pcd_depth
 
     def render_frame_direct(self, vis_xyz: np.ndarray, vis_rgb: np.ndarray,
-                            extra_geoms: list, camera: Camera) -> np.ndarray:
+                            extra_geoms: list, camera: Camera):
         """Render pre-culled points + extra geometry. No Scene needed.
 
         Used by D-lite parallel workers that receive visible points
@@ -218,43 +220,47 @@ class Open3DRenderer:
             camera.eye.astype(np.float64),
             camera.up.astype(np.float64))
 
-        # EDL: clear stale overlays, grab point-cloud-only depth,
-        # then add current overlays
-        edl_depth = None
-        if self.config.edl:
+        # Capture a point-cloud-only depth buffer when EITHER EDL shading or
+        # the box_depth_test 2D-compositing fallback needs it: clear stale
+        # overlays, grab depth, then re-add current overlays. Returned to the
+        # caller so the pipeline's box compositor can depth-test edges.
+        pcd_depth = None
+        if self.config.edl or self.config.box_depth_test:
             self._update_extra_geoms([])
-            edl_depth = np.asarray(
+            pcd_depth = np.asarray(
                 self._renderer.render_to_depth_image(z_in_view_space=True)
             ).astype(np.float32)
 
         self._update_extra_geoms(extra_geoms)
 
-        return self._render_and_postprocess(edl_depth)
+        return self._render_and_postprocess(pcd_depth), pcd_depth
 
-    def _render_and_postprocess(self, edl_depth: Optional[np.ndarray] = None) -> np.ndarray:
-        """Render to image, apply EDL if depth provided.
+    def _render_and_postprocess(self, pcd_depth: Optional[np.ndarray] = None) -> np.ndarray:
+        """Render to image, apply EDL shading only when EDL is enabled.
 
-        When EDL is active, uses point-cloud-only depth (edl_depth) for
-        shading and a second depth pass (with overlays) to detect overlay
-        pixels.  Overlay pixels are protected from EDL darkening.
+        ``pcd_depth`` is the point-cloud-only depth buffer (captured when EDL
+        or box_depth_test is active). EDL shading is gated on
+        ``self.config.edl`` specifically — a depth buffer captured solely for
+        box_depth_test must not trigger darkening.
         """
-        if edl_depth is not None:
+        apply_edl = self.config.edl and pcd_depth is not None
+        if apply_edl:
             depth_full = np.asarray(
                 self._renderer.render_to_depth_image(z_in_view_space=True)
             ).astype(np.float32)
 
         color = np.asarray(self._renderer.render_to_image())
 
-        if edl_depth is None:
+        if not apply_edl:
             return color
 
-        shaded = _edl_shade(color, edl_depth,
+        shaded = _edl_shade(color, pcd_depth,
                             strength=self.config.edl_strength,
                             radius=self.config.edl_radius)
 
         # Protect overlay pixels: where depth changed after adding overlays,
         # keep original color instead of EDL-shaded color
-        overlay_mask = np.abs(depth_full - edl_depth) > 1e-4
+        overlay_mask = np.abs(depth_full - pcd_depth) > 1e-4
         shaded[overlay_mask] = color[overlay_mask]
         return shaded
 

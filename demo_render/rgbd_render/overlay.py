@@ -420,7 +420,8 @@ class BoxOverlay(Overlay):
     own frame-index space via the frame_mapper)."""
 
     def __init__(self, fixtures: List[dict], frame_mapper,
-                 line_width: float = 2.0, category_colors: Optional[dict] = None):
+                 line_width: float = 2.0, category_colors: Optional[dict] = None,
+                 box_depth_test: bool = False):
         """
         Args:
             fixtures: parsed DC-2 JSON ``fixtures`` list — each dict has
@@ -435,9 +436,17 @@ class BoxOverlay(Overlay):
             category_colors: optional {category: (r, g, b) 0-1} override;
                 defaults to analytics/vocabulary.json's color logic
                 (re-derived at construction time — see ``category_color``).
+            box_depth_test: when True, ``apply()`` emits NO 3D LineSet — box
+                edges are instead drawn by the CPU-side 2D depth-tested
+                compositor (``composite_box_edges``) at the label-stamping
+                call site, because the occlusion spike (REQ-017/TASK-031)
+                found unlitLine LineSets do not depth-test here. Emitting the
+                LineSet too would double-draw the edges (always-on-top 3D
+                lines plus the depth-tested 2D lines).
         """
         self.frame_mapper = frame_mapper
         self.line_width = line_width
+        self.box_depth_test = box_depth_test
         self.fixtures = self._validate_fixtures(fixtures)
         # OBS-2 per-run tally: fixtures that survived validation (rendered
         # whenever their window is active) vs. dropped as malformed.
@@ -501,6 +510,11 @@ class BoxOverlay(Overlay):
                 if f['first_frame'] <= analyze_idx <= f['last_frame']]
 
     def apply(self, scene, camera, frame_idx, vis_xyz, vis_rgb, vis_frames):
+        # Under the 2D depth-test fallback the edges are composited on the CPU
+        # after render (see composite_box_edges); emit no 3D LineSet here so
+        # the two paths never double-draw the same edges.
+        if self.box_depth_test:
+            return vis_xyz, vis_rgb, []
         visible = self.visible_fixtures(frame_idx)
         if not visible:
             return vis_xyz, vis_rgb, []
@@ -589,13 +603,23 @@ def build_overlays(cfg, scene):
         else:
             fixtures = doc.get('fixtures', [])
             frame_mapper = _build_frame_mapper(cfg, doc.get('analyze_frame_sampling'))
+            # REQ-018 fallback: the occlusion spike (TASK-031) FAILED for this
+            # deployment, so box edges are always drawn via the CPU-side 2D
+            # depth-test path instead of a 3D LineSet. Turning it on here (a)
+            # tells the renderer to capture the point-cloud-only depth buffer
+            # and (b) tells BoxOverlay.apply() to emit no LineSet. cfg is the
+            # same object the pipeline receives, and box_depth_test round-trips
+            # to parallel workers via RenderConfig.to_dict()/from_dict().
+            cfg.render.box_depth_test = True
             box_overlay = BoxOverlay(fixtures, frame_mapper,
-                                     line_width=ov.box_line_width)
+                                     line_width=ov.box_line_width,
+                                     box_depth_test=True)
             overlays.append(box_overlay)
             specs.append({'type': 'box',
                           'fixtures': box_overlay.fixtures,
                           'line_width': ov.box_line_width,
                           'category_colors': box_overlay.category_colors,
+                          'box_depth_test': True,
                           'frame_mapper': None if frame_mapper is None else {
                               'render_src_fps': frame_mapper.render_src_fps,
                               'render_frame_interval': frame_mapper.render_frame_interval,
@@ -650,6 +674,22 @@ def preset_styles(preset: str):
 # 2D projection (post-processing, not a 3D overlay)
 # ---------------------------------------------------------------------------
 
+def _project_core(point_world: np.ndarray, w2c: np.ndarray,
+                  fx: float, fy: float, cx: float, cy: float):
+    """Project one world point through a precomputed ``w2c`` + pinhole
+    intrinsics. Returns ``(px, py, z_cam)`` where ``z_cam`` is the camera-space
+    (view) depth before the perspective divide, or ``None`` if the point is at/
+    behind the camera plane (``z_cam <= 1e-6``). Does NOT apply frame-bounds
+    clipping — callers decide how to treat off-frame pixels. Shared by
+    ``project_point_to_screen()`` (adds bounds check) and the box-edge depth
+    compositor (needs ``z_cam`` for the depth test)."""
+    p_cam = w2c @ np.append(point_world, 1.0)
+    z = p_cam[2]
+    if z <= 1e-6:
+        return None
+    return float(p_cam[0] * fx / z + cx), float(p_cam[1] * fy / z + cy), float(z)
+
+
 def project_point_to_screen(point_world: np.ndarray, camera: Camera,
                             render_w: int, render_h: int):
     """Pinhole-project one 3D world point to 2D screen pixels, using the same
@@ -662,15 +702,13 @@ def project_point_to_screen(point_world: np.ndarray, camera: Camera,
     """
     w2c = camera.w2c()
     fx, fy, cx, cy = camera.fov_intrinsics(render_w, render_h)
-    p_h = np.append(point_world, 1.0)
-    p_cam = w2c @ p_h
-    if p_cam[2] <= 1e-6:
+    r = _project_core(point_world, w2c, fx, fy, cx, cy)
+    if r is None:
         return None
-    px = p_cam[0] * fx / p_cam[2] + cx
-    py = p_cam[1] * fy / p_cam[2] + cy
+    px, py, _ = r
     if not (0 <= px < render_w and 0 <= py < render_h):
         return None
-    return float(px), float(py)
+    return px, py
 
 
 def stamp_fixture_labels(image: np.ndarray, camera: Camera,
@@ -695,6 +733,93 @@ def stamp_fixture_labels(image: np.ndarray, camera: Camera,
                     font_scale, (0, 0, 0), 3, cv2.LINE_AA)       # outline
         cv2.putText(image, text, (px, py), cv2.FONT_HERSHEY_SIMPLEX,
                     font_scale, (255, 255, 255), 1, cv2.LINE_AA)  # fill
+    return image
+
+
+# Depth tolerance (metres, camera-space) for the box-edge depth test. An edge
+# sample draws when its view-space depth is nearer than the point cloud at that
+# pixel, plus this slack — so a box surface that sits flush against the cloud
+# geometry it bounds still draws instead of z-fighting into invisibility.
+# Sized to the near-plane scale already used by RenderConfig.near (0.1 m).
+_BOX_DEPTH_EPSILON = 0.05
+
+
+def composite_box_edges(image: np.ndarray, camera: Camera,
+                        visible_fixtures: List[dict], cloud_depth: np.ndarray,
+                        category_colors: Optional[dict] = None,
+                        line_width: float = 2.0,
+                        epsilon: float = _BOX_DEPTH_EPSILON) -> np.ndarray:
+    """CPU-side 2D depth-tested box-edge compositor — the REQ-018 fallback for
+    when Open3D's ``unlitLine`` LineSet does not depth-test against the point
+    cloud (occlusion spike / TASK-031 FAIL).
+
+    For each visible fixture's 12 box edges, samples points along the 3D edge,
+    projects each to screen space, and draws short ``cv2.line`` segments only
+    between consecutive samples that are (a) in front of the camera, (b)
+    on-frame, and (c) nearer than the point cloud at that pixel
+    (``edge_depth < cloud_depth + epsilon``). Where the cloud has no valid
+    depth (background), the edge always draws — nothing occludes it there.
+
+    ``cloud_depth`` is the point-cloud-only view-space depth buffer captured by
+    the renderer (``render_to_depth_image(z_in_view_space=True)``), the same
+    per-pixel camera-space Z that ``_project_core`` returns for each sample, so
+    the comparison is apples-to-apples. Rather than interpolating the two
+    endpoints' depths, each sample's exact projected Z is used (equivalent in
+    the limit, and correct across perspective foreshortening). Off-frame /
+    behind-camera samples are skipped, never clamped (REQ-016b principle).
+    Modifies ``image`` in place, returns it."""
+    if cloud_depth is None or not visible_fixtures:
+        return image
+    render_h, render_w = image.shape[:2]
+    w2c = camera.w2c()
+    fx, fy, cx, cy = camera.fov_intrinsics(render_w, render_h)
+    thickness = max(1, int(round(line_width)))
+    cloud_valid = np.isfinite(cloud_depth) & (cloud_depth > 0)
+
+    def _sample_visible(pt_world):
+        """Project one world point; return ((ix, iy), passes_depth) or None if
+        behind camera or off-frame."""
+        r = _project_core(pt_world, w2c, fx, fy, cx, cy)
+        if r is None:
+            return None
+        px, py, z = r
+        ix, iy = int(px), int(py)
+        if not (0 <= ix < render_w and 0 <= iy < render_h):
+            return None
+        # Background (no cloud here) never occludes; else nearer-than-cloud wins.
+        passes = (not cloud_valid[iy, ix]) or (z < cloud_depth[iy, ix] + epsilon)
+        return (ix, iy), passes
+
+    for f in visible_fixtures:
+        bmin = np.asarray(f['bbox_min'], dtype=np.float64)
+        bmax = np.asarray(f['bbox_max'], dtype=np.float64)
+        corners = bmin + _BOX_UNIT_CORNERS * (bmax - bmin)
+        cat = f['category']
+        color = (category_colors or {}).get(cat)
+        if color is None:
+            color = category_color(cat, f.get('group', 'other'))
+        # image is RGB at this stage (BGR conversion happens at imwrite), so
+        # pass color in R,G,B order — matching the 3D LineSet's RGB colors.
+        rgb = (int(color[0] * 255), int(color[1] * 255), int(color[2] * 255))
+
+        for a, b in _BOX_EDGES:
+            p0, p1 = corners[a], corners[b]
+            # Sample density from the edge's on-screen length (~4 px spacing),
+            # capped so a long near-camera edge can't explode the sample count.
+            e0 = _project_core(p0, w2c, fx, fy, cx, cy)
+            e1 = _project_core(p1, w2c, fx, fy, cx, cy)
+            if e0 is not None and e1 is not None:
+                pix_len = np.hypot(e0[0] - e1[0], e0[1] - e1[1])
+                n = int(min(64, max(2, pix_len / 4.0 + 2)))
+            else:
+                n = 64  # an endpoint crosses the camera plane; sample densely
+            prev = None
+            for s in range(n + 1):
+                t = s / n
+                cur = _sample_visible(p0 + (p1 - p0) * t)
+                if prev is not None and cur is not None and prev[1] and cur[1]:
+                    cv2.line(image, prev[0], cur[0], rgb, thickness, cv2.LINE_AA)
+                prev = cur
     return image
 
 

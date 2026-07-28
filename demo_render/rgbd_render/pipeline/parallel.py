@@ -31,8 +31,8 @@ from tqdm import tqdm
 from ..camera import CameraPath
 from ..config import PipelineConfig, RenderConfig
 from ..overlay import (Overlay, CameraOverlay, BoxOverlay, FrameIndexMapper,
-                       stamp_frame_tag, stamp_fixture_labels, TrailStyle,
-                       HeadStyle, preset_styles, parse_color)
+                       stamp_frame_tag, stamp_fixture_labels, composite_box_edges,
+                       TrailStyle, HeadStyle, preset_styles, parse_color)
 from ..renderer import Open3DRenderer, silence_process_stdio
 from ..scene import Scene
 
@@ -90,7 +90,8 @@ def _worker_fn_inner(job_queue, done_counter, init_args):
             overlays.append(BoxOverlay(
                 od['fixtures'], frame_mapper,
                 line_width=od.get('line_width', 2.0),
-                category_colors=od.get('category_colors')))
+                category_colors=od.get('category_colors'),
+                box_depth_test=od.get('box_depth_test', False)))
 
     renderer = Open3DRenderer(config)
     output_dir = init_args['output_dir']
@@ -99,6 +100,7 @@ def _worker_fn_inner(job_queue, done_counter, init_args):
     total_frames = init_args.get('total_frames', 0)
     box_overlay = next((o for o in overlays if isinstance(o, BoxOverlay)), None)
     do_labels = init_args.get('show_labels', False) and box_overlay is not None
+    do_box_depth = config.box_depth_test and box_overlay is not None
 
     while True:
         try:
@@ -113,9 +115,9 @@ def _worker_fn_inner(job_queue, done_counter, init_args):
         if num_visible == 0:
             camera = camera_path[frame_idx]
             empty = np.empty((0, 3), dtype=np.float32)
-            img = _render_with_overlays(renderer, camera, frame_idx,
-                                        empty, empty, overlays,
-                                        c2w_poses)
+            img, pcd_depth = _render_with_overlays(renderer, camera, frame_idx,
+                                                   empty, empty, overlays,
+                                                   c2w_poses)
         else:
             shm = SharedMemory(name=shm_name, create=False)
             xyz_bytes = num_visible * 3 * 4
@@ -130,10 +132,16 @@ def _worker_fn_inner(job_queue, done_counter, init_args):
             shm.unlink()
 
             camera = camera_path[frame_idx]
-            img = _render_with_overlays(renderer, camera, frame_idx,
-                                        vis_xyz, vis_rgb,
-                                        overlays, c2w_poses)
+            img, pcd_depth = _render_with_overlays(renderer, camera, frame_idx,
+                                                   vis_xyz, vis_rgb,
+                                                   overlays, c2w_poses)
 
+        if do_box_depth:
+            composite_box_edges(img, camera,
+                                box_overlay.visible_fixtures(frame_idx),
+                                pcd_depth,
+                                category_colors=box_overlay.category_colors,
+                                line_width=box_overlay.line_width)
         if do_tag:
             stamp_frame_tag(img, frame_idx, total_frames, tag_pos)
         if do_labels:
@@ -150,7 +158,8 @@ def _worker_fn_inner(job_queue, done_counter, init_args):
 def _render_with_overlays(renderer, camera, frame_idx,
                           vis_xyz, vis_rgb,
                           overlays, c2w_poses):
-    """Apply overlays then render."""
+    """Apply overlays then render. Returns (color, pcd_depth) — pcd_depth is
+    the point-cloud-only depth buffer (None unless EDL or box_depth_test)."""
     extra_geoms = []
     for overlay in overlays:
         vis_xyz, vis_rgb, geoms = overlay.apply(

@@ -96,6 +96,12 @@ class RenderConfig:
     edl_radius: int = 2
     lod_target_pixels: float = 1.5
     combined_video: bool = True
+    # Capture a point-cloud-only depth buffer and CPU-composite box edges with
+    # a 2D depth test, instead of drawing them as always-on-top 3D LineSets.
+    # Set True automatically by build_overlays() when a box overlay is active,
+    # because the occlusion spike (REQ-017/TASK-031) found unlitLine does not
+    # depth-test against the point cloud in this renderer configuration.
+    box_depth_test: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

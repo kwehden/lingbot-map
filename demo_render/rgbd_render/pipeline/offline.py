@@ -19,7 +19,8 @@ from tqdm import tqdm
 
 from ..camera import Camera, CameraPath
 from ..config import PipelineConfig
-from ..overlay import Overlay, CameraOverlay, BoxOverlay, stamp_frame_tag, stamp_fixture_labels
+from ..overlay import (Overlay, CameraOverlay, BoxOverlay, stamp_frame_tag,
+                       stamp_fixture_labels, composite_box_edges)
 from ..renderer import Open3DRenderer
 from ..scene import Scene
 from ..video import encode_video, encode_rgb_video, encode_depth_video, encode_combined_video
@@ -144,13 +145,20 @@ class OfflinePipeline:
         tag_pos = self.cfg.overlay.frame_tag_position
         box_overlay = next((o for o in self.overlays if isinstance(o, BoxOverlay)), None)
         do_labels = self.cfg.overlay.show_labels and box_overlay is not None
+        do_box_depth = self.cfg.render.box_depth_test and box_overlay is not None
 
         with tqdm(total=S, unit='frame', dynamic_ncols=True,
                   desc='Rendering') as pbar:
             for fi in range(S):
                 camera = self.camera_path[fi]
-                img = renderer.render_frame(self.scene, camera, fi,
-                                            self.overlays)
+                img, pcd_depth = renderer.render_frame(self.scene, camera, fi,
+                                                       self.overlays)
+                if do_box_depth:
+                    composite_box_edges(img, camera,
+                                        box_overlay.visible_fixtures(fi),
+                                        pcd_depth,
+                                        category_colors=box_overlay.category_colors,
+                                        line_width=box_overlay.line_width)
                 if do_tag:
                     stamp_frame_tag(img, fi, S, tag_pos)
                 if do_labels:
