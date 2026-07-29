@@ -379,21 +379,9 @@ class GCTStream(GCTBase):
         camera head SDPA cache, and decrements the aggregator frame counter.
         Must be called while eviction is still deferred.
         """
-        # FlashInfer manager — rollback each transformer block
-        if hasattr(self.aggregator, 'kv_cache_manager') and self.aggregator.kv_cache_manager is not None:
-            mgr = self.aggregator.kv_cache_manager
-            for block_idx in range(mgr.num_blocks):
-                mgr.rollback_last_frame(block_idx)
-
-        # SDPA aggregator cache — trim last frame along dim=2
-        if hasattr(self.aggregator, 'kv_cache') and isinstance(self.aggregator.kv_cache, dict):
-            kv = self.aggregator.kv_cache
-            for key in list(kv.keys()):
-                if key.startswith(("k_", "v_")) and kv[key] is not None and torch.is_tensor(kv[key]):
-                    if kv[key].dim() >= 3 and kv[key].shape[2] > 1:
-                        kv[key] = kv[key][:, :, :-1]
-                    elif kv[key].dim() >= 3:
-                        kv[key] = None
+        backend = self.aggregator.get_kv_cache_backend()
+        if backend is not None:
+            backend.rollback_last_frame_all_blocks()
 
         # Camera head
         if self.camera_head is not None and hasattr(self.camera_head, 'rollback_last_frame'):
@@ -404,15 +392,12 @@ class GCTStream(GCTBase):
 
     def _execute_deferred_eviction(self):
         """Execute the eviction that was deferred during the last forward pass."""
-        # FlashInfer manager
-        if hasattr(self.aggregator, 'kv_cache_manager') and self.aggregator.kv_cache_manager is not None:
-            mgr = self.aggregator.kv_cache_manager
-            for block_idx in range(mgr.num_blocks):
-                mgr.execute_deferred_eviction(
-                    block_idx,
-                    scale_frames=self.kv_cache_scale_frames,
-                    sliding_window=self.kv_cache_sliding_window,
-                )
+        backend = self.aggregator.get_kv_cache_backend()
+        if backend is not None:
+            backend.execute_deferred_eviction_all_blocks(
+                scale_frames=self.kv_cache_scale_frames,
+                sliding_window=self.kv_cache_sliding_window,
+            )
 
     def get_kv_cache_info(self) -> Dict[str, Any]:
         """
