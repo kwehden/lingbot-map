@@ -263,11 +263,30 @@ def _free_cuda() -> None:
 
 
 def _tensor_dict_close(a: dict, b: dict, tol: dict) -> dict:
+    """Per-key parity between two prediction dicts.
+
+    _OUTPUT_KEYS lists every key the model *can* emit, but which are actually present
+    depends on the model config: world_points/world_points_conf only exist when
+    enable_point=True, and the production pipeline (benchmark/methods/lingbot_map.py and
+    demo.py) leaves enable_point at its False default, so those two keys are legitimately
+    absent from both runs. A key absent from BOTH is parity -- same before and after the
+    refactor -- so it counts as close=True. A key present in one run but not the other IS
+    a real divergence (the refactor added or dropped an output) and stays close=False, so
+    callers' `all(v["close"] for ...)` aggregation still catches that case.
+    """
     import torch
     diffs = {}
     for key in _OUTPUT_KEYS:
-        if key not in a or key not in b:
-            diffs[key] = {"present_baseline": key in a, "present_compare": key in b}
+        in_a, in_b = key in a, key in b
+        if not in_a and not in_b:
+            diffs[key] = {"close": True, "absent_both": True}
+            continue
+        if in_a != in_b:
+            diffs[key] = {
+                "close": False,
+                "present_baseline": in_a,
+                "present_compare": in_b,
+            }
             continue
         ta, tb = a[key].float(), b[key].float()
         close = torch.allclose(ta, tb, rtol=tol["rtol"], atol=tol["atol"])
