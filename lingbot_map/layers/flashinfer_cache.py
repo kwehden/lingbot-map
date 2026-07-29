@@ -173,6 +173,7 @@ class FlashInferKVCacheManager:
         # When True, evict_frames() becomes a no-op; caller must later call
         # execute_deferred_eviction() or rollback_last_frame().
         self._defer_eviction: bool = False
+        self._skip_append: bool = False
 
         # ── FlashInfer wrapper ───────────────────────────────────────────────
         # plan() is called once per frame step (block_idx == 0).
@@ -299,6 +300,26 @@ class FlashInferKVCacheManager:
 
         # 3) Decrement frame count
         self.frame_count[block_idx] -= 1
+
+    def rollback_last_frame_all_blocks(self) -> None:
+        for i in range(self.num_blocks):
+            self.rollback_last_frame(i)
+
+    def execute_deferred_eviction_all_blocks(self, scale_frames, sliding_window) -> None:
+        for i in range(self.num_blocks):
+            self.execute_deferred_eviction(i, scale_frames, sliding_window)
+
+    def get_skip_append(self) -> bool:
+        return self._skip_append
+
+    def set_skip_append(self, flag: bool) -> None:
+        self._skip_append = flag
+
+    def get_defer_eviction(self) -> bool:
+        return self._defer_eviction
+
+    def set_defer_eviction(self, flag: bool) -> None:
+        self._defer_eviction = flag
 
     def get_cache_stats(self, block_idx: int = 0) -> dict:
         """Read-only snapshot of cache occupancy for one block.
