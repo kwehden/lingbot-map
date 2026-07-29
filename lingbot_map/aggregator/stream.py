@@ -333,18 +333,12 @@ class AggregatorStream(AggregatorBase):
         # Get effective num_frame_for_scale
         scale_frames = self.num_frame_for_scale if num_frame_for_scale is None else num_frame_for_scale
 
-        # Check cache state for both backends
-        has_flashinfer_cache = self.kv_cache_manager is not None and self.kv_cache_manager.num_frames > 0
-        has_sdpa_cache = self.kv_cache is not None and self.kv_cache.get("k_0") is not None
-
         # Determine if we're in causal inference mode based on KV cache state
         causal_inference = True
 
-        if causal_inference and has_flashinfer_cache:
-            S_cached = self.kv_cache_manager.num_frames
-            S_true = S_cached + S_global
-        elif causal_inference and has_sdpa_cache:
-            _, _, S_cached, _, _ = self.kv_cache["k_0"].shape
+        backend = self.get_kv_cache_backend()
+        if causal_inference and backend is not None and backend.num_frames > 0:
+            S_cached = backend.num_frames
             S_true = S_cached + S_global
         else:
             S_true = S_global

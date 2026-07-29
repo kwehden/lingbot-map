@@ -253,14 +253,14 @@ class FlashInferBlock(nn.Module):
             # paged cache, so we temporarily append (with eviction deferred so
             # it stays clean), attend, and then roll back the append.  Mirrors
             # the ``skip_append`` behavior of the SDPA dict path.
-            skip_append = getattr(manager, '_skip_append', False)
+            skip_append = manager.get_skip_append()
             if skip_append:
-                prev_defer = manager._defer_eviction
-                manager._defer_eviction = True
+                prev_defer = manager.get_defer_eviction()
+                manager.set_defer_eviction(True)
                 manager.append_frame(global_idx, k_nhd, v_nhd)
                 attn_x = manager.compute_attention(global_idx, q_nhd)
                 manager.rollback_last_frame(global_idx)
-                manager._defer_eviction = prev_defer
+                manager.set_defer_eviction(prev_defer)
             else:
                 # Eager: write frame K/V to paged cache
                 manager.append_frame(global_idx, k_nhd, v_nhd)
