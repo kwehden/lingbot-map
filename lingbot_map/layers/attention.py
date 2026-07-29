@@ -518,18 +518,18 @@ class FlashInferAttention(Attention):
                 # temporarily append (with eviction deferred so it stays clean),
                 # attend, and then roll back the append.  Mirrors the
                 # ``skip_append`` behavior of the SDPA path.
-                skip_append = getattr(manager, '_skip_append', False)
+                skip_append = manager.get_skip_append()
                 if skip_append:
                     # Defensive fallback: the hot path for FlashInfer streaming
                     # is `FlashInferBlock.forward` which inlines this logic.
                     # Kept here for any caller that invokes
                     # ``FlashInferAttention.forward`` with a single frame.
-                    prev_defer = manager._defer_eviction
-                    manager._defer_eviction = True
+                    prev_defer = manager.get_defer_eviction()
+                    manager.set_defer_eviction(True)
                     manager.append_frame(global_idx, k_nhd, v_nhd)
                     x = manager.compute_attention(global_idx, q_nhd)
                     manager.rollback_last_frame(global_idx)
-                    manager._defer_eviction = prev_defer
+                    manager.set_defer_eviction(prev_defer)
                 else:
                     # 1. Append to paged cache
                     manager.append_frame(global_idx, k_nhd, v_nhd)
