@@ -288,8 +288,9 @@ class GCTStream(GCTBase):
         Call this method when starting a new video sequence to clear
         cached key-value pairs from previous sequences.
         """
-        if hasattr(self.aggregator, 'clean_kv_cache'):
-            self.aggregator.clean_kv_cache()
+        backend = self.aggregator.get_kv_cache_backend()
+        if backend is not None:
+            backend.reset()
         else:
             logger.warning("Aggregator does not support KV cache cleaning")
         if hasattr(self.camera_head, 'kv_cache'):
@@ -307,12 +308,9 @@ class GCTStream(GCTBase):
         Args:
             skip: If True, subsequent forward passes will not append KV to cache.
         """
-        if hasattr(self.aggregator, 'kv_cache') and self.aggregator.kv_cache is not None:
-            self.aggregator.kv_cache["_skip_append"] = skip
-        # FlashInfer manager — honored by attention.py's FlashInfer phase-2
-        # branch to avoid persisting non-keyframes in the paged cache.
-        if hasattr(self.aggregator, 'kv_cache_manager') and self.aggregator.kv_cache_manager is not None:
-            self.aggregator.kv_cache_manager._skip_append = skip
+        backend = self.aggregator.get_kv_cache_backend()
+        if backend is not None:
+            backend.set_skip_append(skip)
         if self.camera_head is not None and hasattr(self.camera_head, 'kv_cache') and self.camera_head.kv_cache is not None:
             for cache_dict in self.camera_head.kv_cache:
                 cache_dict["_skip_append"] = skip
@@ -326,7 +324,12 @@ class GCTStream(GCTBase):
                 - num_cached_blocks: Number of blocks with cached KV
                 - cache_memory_mb: Approximate memory usage in MB
         """
-        if not hasattr(self.aggregator, 'kv_cache') or self.aggregator.kv_cache is None:
+        backend = self.aggregator.get_kv_cache_backend()
+        if backend is None or not self.aggregator.use_sdpa:
+            # FlashInfer backend (or not-yet-initialized): preserved bug —
+            # always reports empty stats here regardless of actual cache
+            # occupancy. Use get_kv_cache_backend().get_cache_stats() for
+            # real numbers.
             return {"num_cached_blocks": 0, "cache_memory_mb": 0.0}
 
         kv_cache = self.aggregator.kv_cache
