@@ -372,7 +372,8 @@ def run_compare(args) -> dict:
         model = _build_model(mode, use_sdpa, args.checkpoint, device)
         run = _run_inference(model, mode, images)
         tag = f"{mode}_{'sdpa' if use_sdpa else 'flashinfer'}"
-        baseline_pred = torch.load(baseline_predictions_dir / f"demo_{tag}.pt")
+        baseline_pred = torch.load(
+            baseline_predictions_dir / f"demo_{tag}.pt", weights_only=False)
         noise = baseline_results["checks"]["noise_floors"]["values"].get(tag, {})
         tol = {
             "rtol": _DEFAULT_TOL["bf16"]["rtol"],
@@ -392,7 +393,8 @@ def run_compare(args) -> dict:
     # force_fp32 configuration.
     model = _build_model("streaming", False, args.checkpoint, device)
     run = _run_inference(model, "streaming", images, device, force_fp32=True)
-    baseline_pred = torch.load(baseline_predictions_dir / "demo_streaming_flashinfer_fp32.pt")
+    baseline_pred = torch.load(
+        baseline_predictions_dir / "demo_streaming_flashinfer_fp32.pt", weights_only=False)
     noise = baseline_results["checks"]["noise_floors"]["values"].get(
         "streaming_flashinfer_fp32", {})
     tol = {
@@ -417,16 +419,33 @@ def run_compare(args) -> dict:
         tag = f"{mode}_{'sdpa' if use_sdpa else 'flashinfer'}"
         output = _run_benchmark_harness(mode, use_sdpa, args.checkpoint, device,
                                          tum_root, args.scene)
-        baseline_output = torch.load(baseline_predictions_dir / f"harness_{tag}.pt")
+        # process_scene() returns numpy arrays inside a nested dict, which torch 2.6+'s
+        # weights_only=True default refuses to unpickle -- these are our own artifacts
+        # written by this script's baseline run, so opt out explicitly.
+        baseline_output = torch.load(
+            baseline_predictions_dir / f"harness_{tag}.pt", weights_only=False)
+        # This is a bf16 harness run, so it gets the bf16 tolerance widened by this
+        # config's own measured noise floor -- NOT whatever `tol` the fp32 block above
+        # happened to leave bound.
+        harness_noise = baseline_results["checks"]["noise_floors"]["values"].get(tag, {})
+        harness_tol = {
+            "rtol": _DEFAULT_TOL["bf16"]["rtol"],
+            "atol": max(
+                _DEFAULT_TOL["bf16"]["atol"],
+                3 * max(harness_noise.values()) if harness_noise
+                else _DEFAULT_TOL["bf16"]["atol"],
+            ),
+        }
         # LingbotMapMethod.process_scene() returns {'frame': {...lists...}, 'global': {}};
-        # compare depth/pose lists element-wise at the same tolerance as demo_parity.
+        # compare depth lists element-wise at the same tolerance as demo_parity.
         b_depth = baseline_output["frame"]["depth"]
         c_depth = output["frame"]["depth"]
         depth_close = len(b_depth) == len(c_depth) and all(
-            abs(bd - cd).max() <= tol["atol"] + tol["rtol"] * abs(bd).max()
+            abs(bd - cd).max()
+            <= harness_tol["atol"] + harness_tol["rtol"] * abs(bd).max()
             for bd, cd in zip(b_depth, c_depth)
         )
-        harness_check[tag] = {"pass": bool(depth_close)}
+        harness_check[tag] = {"pass": bool(depth_close), "tol": harness_tol}
         all_pass = all_pass and depth_close
         del output, baseline_output
         _free_cuda()
