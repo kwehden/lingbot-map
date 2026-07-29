@@ -307,6 +307,15 @@ class GCTStream(GCTBase):
         backend = self.aggregator.get_kv_cache_backend()
         if backend is not None:
             backend.set_skip_append(skip)
+        # The backend call sets the SDPA dict key (SDPA backend) or the manager
+        # attribute (FlashInfer). But AggregatorStream._process_causal_stream's
+        # total_frames_processed guard reads self.kv_cache["_skip_append"] directly for
+        # BOTH backends, and that read site is deliberately out of the refactor's scope.
+        # On the FlashInfer path the backend never touches that dict, so the counter would
+        # increment on skipped non-keyframes and corrupt 3D RoPE's f_start/f_end. Keep the
+        # aggregator-dict write the pre-refactor code did unconditionally (harmlessly
+        # redundant with the backend write on the SDPA path, where the dict is the cache).
+        self.aggregator.kv_cache["_skip_append"] = skip
         if self.camera_head is not None and hasattr(self.camera_head, 'kv_cache') and self.camera_head.kv_cache is not None:
             for cache_dict in self.camera_head.kv_cache:
                 cache_dict["_skip_append"] = skip

@@ -348,6 +348,12 @@ class GCTStream(GCTBase):
         backend = self.aggregator.get_kv_cache_backend()
         if backend is not None:
             backend.set_skip_append(skip)
+        # See gct_stream.py::_set_skip_append: AggregatorStream._process_causal_stream reads
+        # self.kv_cache["_skip_append"] directly for BOTH backends (a deliberately
+        # out-of-scope read site), and the FlashInfer backend never writes that dict, so the
+        # total_frames_processed guard would misfire and corrupt 3D RoPE positions. Preserve
+        # the pre-refactor aggregator-dict write here too.
+        self.aggregator.kv_cache["_skip_append"] = skip
         if self.camera_head is not None and hasattr(self.camera_head, 'kv_cache') and self.camera_head.kv_cache is not None:
             for cache_dict in self.camera_head.kv_cache:
                 cache_dict["_skip_append"] = skip
