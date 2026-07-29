@@ -288,11 +288,7 @@ class GCTStream(GCTBase):
         Call this method when starting a new video sequence to clear
         cached key-value pairs from previous sequences.
         """
-        backend = self.aggregator.get_kv_cache_backend()
-        if backend is not None:
-            backend.reset()
-        else:
-            logger.warning("Aggregator does not support KV cache cleaning")
+        self.aggregator.clean_kv_cache()
         if hasattr(self.camera_head, 'kv_cache'):
             self.camera_head.clean_kv_cache()
         else:
