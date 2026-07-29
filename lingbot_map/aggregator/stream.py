@@ -14,6 +14,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, List
 
 from lingbot_map.layers.block import Block, FlashInferBlock, SDPABlock
+from lingbot_map.layers.kv_cache_backend import KVCacheBackend, SDPADictKVCacheBackend
 from lingbot_map.layers.rope import WanRotaryPosEmbed
 from lingbot_map.aggregator.base import AggregatorBase, slice_expand_and_flatten
 
@@ -194,6 +195,20 @@ class AggregatorStream(AggregatorBase):
                 logger.info(f"SDPA KV cache initialized with {self.depth} blocks")
         else:
             logger.info("FlashInfer KV cache will be lazily initialized on first forward")
+
+        self._sdpa_backend = (
+            SDPADictKVCacheBackend(self.kv_cache, num_blocks=self.depth)
+            if self.use_sdpa else None
+        )
+
+    def get_kv_cache_backend(self) -> Optional[KVCacheBackend]:
+        """Return this aggregator's active cache backend, or None if the
+        FlashInfer manager has not been lazily initialized yet (mirrors
+        today's hasattr/is-not-None tolerance at GCTStream's six call
+        sites)."""
+        if self.use_sdpa:
+            return self._sdpa_backend
+        return self.kv_cache_manager
 
     def _get_flashinfer_manager(self, device, dtype, tokens_per_frame=None):
         """Lazily initialize FlashInferKVCacheManager on first use.
