@@ -91,17 +91,32 @@ def _parse_raw_data(data: Dict[str, np.ndarray]) -> Dict:
         K_raw = np.tile(K_raw[None], (len(images), 1, 1))
 
     if 'extrinsic' not in data:
-        raise ValueError("NPZ must contain 'extrinsic' (camera-to-world poses).")
+        raise ValueError("NPZ must contain 'extrinsic' (W2C poses).")
     ext = data['extrinsic'].astype(np.float32)
     nf = ext.shape[0]
-    # `extrinsic` is already camera-to-world (c2w): the producer
-    # (demo.py::postprocess) explicitly converts the model's raw w2c pose
-    # encoding to c2w before writing it to the NPZ. Pad the stored 3x4 into
-    # a 4x4 directly — do NOT invert again here (a prior version of this
-    # function assumed `extrinsic` was still w2c and re-inverted it, which
-    # silently double-inverted an already-c2w matrix).
+    # The stored `extrinsic` is world-to-camera, so invert it to get c2w.
+    #
+    # This is confusing because demo.py::postprocess appears to convert to c2w
+    # already ("# Convert w2c to c2w"). It does apply an inversion, but the
+    # tensor it inverts is mislabeled: pose_encoding_to_extri_intri documents
+    # its output as "camera from world" while actually decoding pose_enc
+    # directly to c2w. So postprocess turns c2w into w2c, and the stored
+    # `extrinsic` ends up w2c despite the naming.
+    #
+    # Verified against the NPZs: reading `extrinsic` as c2w (i.e. skipping this
+    # inversion) makes reprojection between overlapping frames disagree
+    # photometrically by 0.111 vs 0.043 mean abs RGB and by 19% vs 4% relative
+    # depth, and inflates the camera-trajectory bbox diagonal 1.97x (3.99m ->
+    # 7.84m), which straightens the camera path and misplaces fixture boxes.
+    w2c = np.zeros((nf, 4, 4), dtype=np.float32)
+    w2c[:, :3, :] = ext[:, :3, :]
+    w2c[:, 3, 3] = 1.0
+    R = w2c[:, :3, :3]
+    t = w2c[:, :3, 3:4]
+    Rt = R.transpose(0, 2, 1)
     c2w = np.zeros((nf, 4, 4), dtype=np.float32)
-    c2w[:, :3, :] = ext[:, :3, :]
+    c2w[:, :3, :3] = Rt
+    c2w[:, :3, 3:4] = -Rt @ t
     c2w[:, 3, 3] = 1.0
 
     confidence = None
