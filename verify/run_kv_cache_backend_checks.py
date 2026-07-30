@@ -118,20 +118,64 @@ def _build_model(mode: str, use_sdpa: bool, checkpoint: str, device: str):
     )
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     state_dict = ckpt.get("model", ckpt)
-    model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    # Report load fidelity explicitly. strict=False silently tolerates a checkpoint that
+    # does not match the architecture, which for a BASELINE would mean staging predictions
+    # from a partly-randomly-initialized model and diffing everything else against them --
+    # a false reference nobody would notice. Print the counts (mirroring
+    # benchmark/methods/lingbot_map.py's own diagnostics) and fail loudly on wholesale
+    # mismatch rather than producing a quietly worthless baseline.
+    tag = f"{mode}/{'sdpa' if use_sdpa else 'flashinfer'}"
+    print(f"[_build_model {tag}] checkpoint={checkpoint} "
+          f"missing={len(missing)} unexpected={len(unexpected)}", flush=True)
+    total = len(state_dict)
+    if len(missing) > 0.5 * max(total, 1):
+        raise RuntimeError(
+            f"Checkpoint load looks wholesale-mismatched for {tag}: {len(missing)} missing "
+            f"keys against a {total}-entry state_dict. Refusing to produce a baseline from "
+            f"a mostly-uninitialized model. Verify the checkpoint matches this architecture "
+            f"(TASK-001 only ever validated it under use_sdpa=True)."
+        )
     return model.to(device).eval()
 
 
 def _run_inference(model, mode: str, images, device=None, force_fp32: bool = False):
+    """Run one inference pass, mirroring gct_profile.py's dtype handling exactly.
+
+    gct_profile.py (the codebase's own bf16-vs-fp32 accuracy harness) is the reference:
+    the model's weights stay fp32 as loaded, the INPUT images are cast to the run's dtype,
+    bf16 runs use autocast and fp32 runs use a null context, and for the FlashInfer
+    backend specifically fp32 additionally requires
+    `aggregator.kv_cache_force_fp32 = True` -- FlashInfer's FA2 kernel only supports
+    fp16/bf16, so that flag switches it to a dense gather + fp32 SDPA path
+    (flashinfer_cache.py's compute_attention).
+
+    Getting this wrong is what failed baseline job 4: disabling autocast without also
+    casting the inputs left fp32 activations meeting bf16 intermediates and raised
+    "mat1 and mat2 must have the same dtype, but got BFloat16 and Float" in attn.proj.
+    """
+    import contextlib
+
     import torch
 
     if device is None:
         device = next(model.parameters()).device
-    images = images.to(device)
+
     dtype = torch.float32 if force_fp32 else (
         torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     )
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype, enabled=not force_fp32):
+    images = images.to(device=device, dtype=dtype)
+
+    if force_fp32:
+        # FlashInfer-only knob; harmless no-op attribute on the SDPA path, but this
+        # configuration is only ever run against FlashInfer (see _CONFIGS comment).
+        model.aggregator.kv_cache_force_fp32 = True
+
+    autocast_ctx = (
+        contextlib.nullcontext() if force_fp32
+        else torch.amp.autocast("cuda", dtype=dtype)
+    )
+    with torch.no_grad(), autocast_ctx:
         if mode == "streaming":
             predictions = model.inference_streaming(
                 images, num_scale_frames=8, keyframe_interval=1,
