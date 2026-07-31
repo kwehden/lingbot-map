@@ -349,6 +349,18 @@ def run_baseline(args) -> dict:
 
     results = {"mode": "baseline", "checks": {}}
 
+    # Every stage below costs real Tier 2 GPU minutes, so each one is flushed to
+    # results.json the moment it completes rather than only at the end. Baseline job 10
+    # computed all five noise floors correctly, then died in the item-2 harness loop on a
+    # missing `plyfile` import -- and because results.json was written only after every
+    # stage, 33 minutes of correct GPU work was discarded. Checkpointing per stage means a
+    # late-stage failure now costs only the stages that had not yet finished. `results` is
+    # also printed, so baseline_run.log carries the numbers even if the S3 sync itself is
+    # what fails.
+    def _checkpoint(stage: str) -> None:
+        (output_dir / "results.json").write_text(json.dumps(results, indent=2))
+        print(f"[run_baseline] checkpointed results.json after stage: {stage}", flush=True)
+
     images = _load_demo_images(tum_root, args.scene)
     predictions_dir = output_dir / "predictions"
     predictions_dir.mkdir(exist_ok=True)
@@ -366,7 +378,10 @@ def run_baseline(args) -> dict:
         noise_floors[tag] = {
             k: v["max_abs_diff"] for k, v in diff.items() if "max_abs_diff" in v
         }
+        print(f"[run_baseline] noise_floor[{tag}] = {noise_floors[tag]}", flush=True)
         torch.save(run_a, predictions_dir / f"demo_{tag}.pt")
+        results["checks"]["noise_floors"] = {"pass": True, "values": noise_floors}
+        _checkpoint(f"noise_floor:{tag}")
         del model, run_a, run_b
         _free_cuda()
 
@@ -378,20 +393,28 @@ def run_baseline(args) -> dict:
     noise_floors["streaming_flashinfer_fp32"] = {
         k: v["max_abs_diff"] for k, v in diff.items() if "max_abs_diff" in v
     }
+    print("[run_baseline] noise_floor[streaming_flashinfer_fp32] = "
+          f"{noise_floors['streaming_flashinfer_fp32']}", flush=True)
     torch.save(run_a, predictions_dir / "demo_streaming_flashinfer_fp32.pt")
     results["checks"]["noise_floors"] = {"pass": True, "values": noise_floors}
+    _checkpoint("noise_floor:streaming_flashinfer_fp32")
     del model, run_a, run_b
     _free_cuda()
 
     # Item 2: benchmark harness parity, both modes x backends.
+    harness_recorded = []
     for mode, use_sdpa in _CONFIGS:
         tag = f"{mode}_{'sdpa' if use_sdpa else 'flashinfer'}"
         output = _run_benchmark_harness(mode, use_sdpa, args.checkpoint, device,
                                          tum_root, args.scene)
         torch.save(output, predictions_dir / f"harness_{tag}.pt")
+        harness_recorded.append(tag)
+        results["checks"]["harness_recorded"] = {
+            "pass": True, "recorded": list(harness_recorded)
+        }
+        _checkpoint(f"harness:{tag}")
         del output
         _free_cuda()
-    results["checks"]["harness_recorded"] = {"pass": True}
 
     # Item 6: get_kv_cache_info byte-identity states (recorded, not compared yet --
     # compare mode diffs against these).
@@ -401,13 +424,14 @@ def run_baseline(args) -> dict:
         for k, v in kv_info_states.items()
     }
     results["checks"]["kv_cache_info_states"] = {"pass": True, "values": kv_info_states}
+    _checkpoint("kv_cache_info_states")
 
     # Items 7/8: Gap A/B preserved, recorded as booleans (must remain the same value
     # in compare mode).
     results["checks"]["gap_a_preserved"] = {"pass": True, "value": _check_gap_a()}
     results["checks"]["gap_b_preserved"] = {"pass": True, "value": _check_gap_b()}
 
-    (output_dir / "results.json").write_text(json.dumps(results, indent=2))
+    _checkpoint("complete")
     return results
 
 
