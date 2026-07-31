@@ -675,10 +675,25 @@ def run_compare(args) -> dict:
         probe_path = Path(args.kv_info_baseline)
         if probe_path.is_file():
             probe = json.loads(probe_path.read_text())
+            # A probe recorded from THIS checkout is the refactor comparing against itself
+            # -- guaranteed to pass and worth nothing. The probe records its own
+            # module_root precisely so this is detectable; refuse rather than silently
+            # manufacture a self-referential baseline.
+            probe_root = probe.get("module_root")
+            if probe_root:
+                import lingbot_map
+                here = str(Path(lingbot_map.__file__).resolve().parent.parent)
+                if str(Path(probe_root).resolve()) == here:
+                    raise RuntimeError(
+                        f"--kv_info_baseline was recorded from the SAME checkout this "
+                        f"compare run is using ({here!r}). That would compare the refactor "
+                        f"against itself and pass unconditionally. Record the probe from a "
+                        f"clone of the baseline ref, with PYTHONPATH set to that clone."
+                    )
             probe_values = probe.get("kv_cache_info_states", probe)
             for k, v in probe_values.items():
                 baseline_kv_states.setdefault(k, v)
-            probe_source = f"{probe_path.name}+staged_baseline"
+            probe_source = f"{probe_path.name}({probe_root})+staged_baseline"
         else:
             probe_source = "staged_baseline (probe file absent)"
 
@@ -840,12 +855,39 @@ def run_kv_info_probe(args) -> dict:
     --kv_info_baseline.
     """
     import torch
+    import lingbot_map
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Record and optionally ASSERT which lingbot_map actually got imported.
+    #
+    # This matters more than it looks. The Tier 2 worker `pip install -e`s the checkout at
+    # ~/lingbot-map, so `import lingbot_map` resolves through that editable install. Running
+    # this script from inside a *different* clone does NOT override it: sys.path[0] for a
+    # script is the script's own directory (<clone>/verify), not the clone root. So a probe
+    # intended to measure the BASELINE ref would silently import and measure the REFACTOR
+    # code, and record the result as a baseline -- a false reference of exactly the kind
+    # that makes every downstream comparison meaningless while looking perfectly healthy.
+    #
+    # Callers must therefore set PYTHONPATH to the clone root, and pass
+    # --expect_module_root to have that actually verified rather than assumed.
+    module_root = str(Path(lingbot_map.__file__).resolve().parent.parent)
+    print(f"[run_kv_info_probe] imported lingbot_map from: {module_root}", flush=True)
+    if args.expect_module_root:
+        expected = str(Path(args.expect_module_root).resolve())
+        if module_root != expected:
+            raise RuntimeError(
+                f"Refusing to record a probe from the wrong checkout: imported "
+                f"lingbot_map from {module_root!r} but --expect_module_root is "
+                f"{expected!r}. Set PYTHONPATH to the intended clone root. Recording this "
+                f"as a baseline would silently compare the refactor against itself."
+            )
+
     values = _check_get_kv_cache_info(device)
-    payload = {"mode": "kv_info_probe", "kv_cache_info_states": values}
+    payload = {"mode": "kv_info_probe", "module_root": module_root,
+               "kv_cache_info_states": values}
     (output_dir / "kv_info_probe.json").write_text(json.dumps(payload, indent=2))
     print(f"[run_kv_info_probe] {json.dumps(values, indent=2)}", flush=True)
     return payload
@@ -867,6 +909,10 @@ def main():
                          help="Optional kv_info_probe.json from the baseline ref, "
                               "supplying baseline values for item-6 sub-checks the "
                               "staged baseline predates (e.g. flashinfer_cache_stats).")
+    parser.add_argument("--expect_module_root", default=None,
+                         help="For --mode kv_info_probe: assert that `import lingbot_map` "
+                              "resolves inside this directory, so a probe cannot silently "
+                              "measure a different checkout than intended.")
     args = parser.parse_args()
 
     if args.mode == "compare" and not args.baseline_dir:
