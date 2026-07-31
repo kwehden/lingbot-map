@@ -51,9 +51,10 @@ measurement was not taken, and this table should not be read as fully satisfying
 | `windowed_sdpa` | 0.0 | 0.0 | 0.0 |
 | `streaming_flashinfer_fp32` (`force_fp32=True`) | 0.0 | 0.0 | 0.0 |
 
-**Reproduced independently twice.** These values were measured on two separate Tier 2 spot
-instances (jobs 13 and 15) that produced byte-identical floors. Two runs on different hardware
-agreeing is a materially stronger basis than a single run's numbers.
+**Reproduced independently three times.** These values were measured on three separate Tier 2 spot
+instances (jobs 13, 15, and 16) that produced byte-identical floors. Three runs on different hardware
+agreeing is a materially stronger basis than a single run's numbers. Job 16 is the run that completed
+cleanly end-to-end (`SUCCEEDED`, 38m23s), so its `results.json` is the canonical baseline reference.
 
 ### Read 0.0 correctly: this is determinism, not an unexercised measurement
 
@@ -153,3 +154,8 @@ vacuous**. `get_kv_cache_info` reads only the SDPA dict, which is `{}` for Flash
 recorded states are `{0, 0.0}` and compare mode's equality gate passes even if a refactor breaks
 FlashInfer cache accounting entirely. That zero-return is Decision 3's deliberately-preserved bug.
 Details in `_check_get_kv_cache_info`'s docstring.
+
+**Confirmed on hardware.** This was first derived by reading the code, then job 16's real
+`results.json` matched the prediction exactly: FlashInfer `[{0, 0.0}, {0, 0.0}]` versus SDPA
+`[{24 blocks, 0.0 MB}, {24 blocks, 25.78 MB}]`. The SDPA leg's values change across inference; the
+FlashInfer leg's cannot.
