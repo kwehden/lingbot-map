@@ -465,7 +465,10 @@ class BoxOverlay(Overlay):
     def _validate_fixtures(fixtures: List[dict]) -> List[dict]:
         """Drop fixtures missing required geometry/label/window fields, warning
         on each skip (feeds TASK-017's rendered/skipped tally). Fixtures with
-        only ``frames_seen`` get first_frame/last_frame derived from it."""
+        only ``frames_seen`` get first_frame/last_frame derived from it;
+        fixtures with only first_frame/last_frame get a dense frames_seen set
+        spanning the window, so ``visible_fixtures`` has one uniform membership
+        test to apply."""
         cleaned = []
         for f in fixtures:
             fid = f.get('id', '?')
@@ -475,10 +478,10 @@ class BoxOverlay(Overlay):
                 print(f"[warn] Skipping fixture id={fid}: missing required field {missing}")
                 continue
 
+            seen = f.get('frames_seen')
             first = f.get('first_frame')
             last = f.get('last_frame')
             if first is None or last is None:
-                seen = f.get('frames_seen')
                 if not seen:
                     print(f"[warn] Skipping fixture id={fid}: missing required field "
                           f"first_frame/last_frame or frames_seen")
@@ -493,21 +496,47 @@ class BoxOverlay(Overlay):
             entry = dict(f)
             entry['first_frame'] = first
             entry['last_frame'] = last
+            # Membership set for visible_fixtures. When the analyze job gave us
+            # per-frame observations, honour them exactly; otherwise fall back
+            # to the dense window (older DC-2 artifacts carry no frames_seen).
+            entry['_seen_set'] = set(seen) if seen else None
             cleaned.append(entry)
         return cleaned
 
     def visible_fixtures(self, frame_idx: int) -> List[dict]:
-        """Fixtures whose [first_frame, last_frame] window covers this render
-        frame (after remapping into analyze-frame space). Also consumed by the
-        label-stamping step so box and label visibility can never disagree."""
+        """Fixtures actually observed at this render frame (after remapping into
+        analyze-frame space). Also consumed by the label-stamping step so box
+        and label visibility can never disagree.
+
+        Membership is tested against ``frames_seen`` — the frames the analyze
+        job's frustum test actually saw the fixture in — NOT the
+        ``[first_frame, last_frame]`` span. The span is only the min/max of that
+        set, so a fixture seen early and again much later would otherwise draw
+        continuously through the gap between, when the camera is somewhere else
+        entirely. On the seattle_PXL_20260617_164211228 capture 20 of 55
+        fixtures span >90% of the video with internal gaps up to 416 frames;
+        drawing the span put 24-34 boxes per frame in empty space (median
+        centroid-to-nearest-geometry distance 3.3m vs 0.2m when honouring
+        frames_seen) and inflated total box-frames 2.47x.
+
+        Fixtures whose artifact carried no ``frames_seen`` keep the old dense
+        window behaviour (``_seen_set is None``).
+        """
         if self.frame_mapper is None:
             analyze_idx = frame_idx
         else:
             analyze_idx = self.frame_mapper.map(frame_idx)
             if analyze_idx is None:
                 return []
-        return [f for f in self.fixtures
-                if f['first_frame'] <= analyze_idx <= f['last_frame']]
+        out = []
+        for f in self.fixtures:
+            if not (f['first_frame'] <= analyze_idx <= f['last_frame']):
+                continue
+            seen = f['_seen_set']
+            if seen is not None and analyze_idx not in seen:
+                continue
+            out.append(f)
+        return out
 
     def apply(self, scene, camera, frame_idx, vis_xyz, vis_rgb, vis_frames):
         # Under the 2D depth-test fallback the edges are composited on the CPU
