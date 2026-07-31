@@ -156,17 +156,21 @@ class LingbotMapMethod(BaseMethod):
         print(f"  → Running {self.mode} inference (dtype: {dtype})")
 
         num_frames = images.shape[0]
+        # Resolve before the mode branch: BOTH inference paths need a concrete int.
+        # inference_windowed does `max(keyframe_interval, 1)` (gct_stream_window.py:1188),
+        # which raises TypeError on the default "auto" string, so passing the raw config
+        # value through on the windowed branch crashed every windowed harness run.
+        keyframe_interval = _resolve_keyframe_interval(
+            self.keyframe_interval, num_frames, self.auto_keyframe_threshold
+        )
+        if keyframe_interval != self.keyframe_interval:
+            print(
+                f"  → Auto-selected keyframe_interval={keyframe_interval} "
+                f"(num_frames={num_frames}, raw={self.keyframe_interval!r}, "
+                f"threshold={self.auto_keyframe_threshold})"
+            )
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
             if self.mode == 'streaming':
-                keyframe_interval = _resolve_keyframe_interval(
-                    self.keyframe_interval, num_frames, self.auto_keyframe_threshold
-                )
-                if keyframe_interval != self.keyframe_interval:
-                    print(
-                        f"  → Auto-selected keyframe_interval={keyframe_interval} "
-                        f"(num_frames={num_frames}, raw={self.keyframe_interval!r}, "
-                        f"threshold={self.auto_keyframe_threshold})"
-                    )
                 predictions = self.model.inference_streaming(
                     images,
                     num_scale_frames=self.num_scale_frames,
@@ -179,7 +183,7 @@ class LingbotMapMethod(BaseMethod):
                     window_size=self.window_size,
                     overlap_size=self.overlap_size,
                     num_scale_frames=self.num_scale_frames,
-                    keyframe_interval=self.keyframe_interval,
+                    keyframe_interval=keyframe_interval,
                     flow_threshold=self.flow_threshold,
                     max_non_keyframe_gap=self.max_non_keyframe_gap,
                     output_device=torch.device("cpu"),
