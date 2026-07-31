@@ -33,7 +33,15 @@ run's output is retained on disk.
 
 ## Measured noise floor
 
-All five configurations, all recorded output keys:
+All five configurations, for the three output keys the production configuration actually emits.
+This is **not** full output coverage — see [Coverage gap](#coverage-gap--3-of-5-output-keys) below,
+which is wider than the key count suggests.
+
+**Only the absolute difference was measured.** Decision 4 step 2 (and `TASK-003` step 2) call for
+max absolute **and** max relative difference per key; the harness computes only `max_abs`
+(`verify/run_kv_cache_backend_checks.py:353`). With an exactly-zero absolute floor the relative
+figure is zero or undefined, so nothing downstream changes — but the relative half of the required
+measurement was not taken, and this table should not be read as fully satisfying that clause.
 
 | Configuration | `pose_enc` | `depth` | `depth_conf` |
 |---|---|---|---|
@@ -85,6 +93,13 @@ Decision 4 sets the gate at `max(default, 3 × measured_noise_floor)`. Since the
 
 These are the values `TASK-021`/`022`/`023` must use. The floor did not widen the gate.
 
+**Caveat for whoever re-measures this.** Compare mode widens **only `atol`** by
+`3 × max(noise)` and never touches `rtol` (`run_kv_cache_backend_checks.py:485-490`, `:512-518`,
+`:538-544`). With a zero floor that is identical to the defaults above, so it is currently harmless.
+But if a future re-measurement returns a nonzero floor, `rtol` will silently stay at its default
+while `atol` moves — which is not what Decision 4's `max(default, 3 × noise_floor)` says. Fix the
+widening logic before trusting a nonzero floor.
+
 ## Coverage gap — 3 of 5 output keys
 
 `TASK-003`'s verification clause asks for a recorded noise floor **per output key** across
@@ -109,3 +124,32 @@ the table above:
 
 Until then, any `TASK-021`/`022`/`023` parity claim about `world_points`/`world_points_conf` rests
 on no measured floor and should say so.
+
+### The gap is wider than "3 of 5": three windowed outputs have no gate at all
+
+`_OUTPUT_KEYS` (`run_kv_cache_backend_checks.py:55`) lists five keys, so "3 of 5" describes only the
+*named* set. The model emits more than those five, and the unnamed ones are never diffed by compare
+mode:
+
+- `inference_streaming` also returns `images` (`gct_stream_window.py:659`) — visualization payload,
+  low risk.
+- `inference_windowed` additionally returns **`chunk_scales`**, **`chunk_transforms`**
+  (`gct_stream_window.py:952-955`), and `alignment_mode`.
+
+`chunk_scales` / `chunk_transforms` are the **cross-window alignment outputs** — arguably the
+numerics most exposed to a KV-cache refactor in windowed mode, since they depend on per-window state.
+They have no measured noise floor and no parity gate. So the honest statement of coverage is: **3 of
+5 named keys, plus 3 unnamed windowed keys with no gate at all.**
+
+Whether that omission is intentional is an open question for the tech lead. If it is deliberate,
+record why here; if not, `TASK-021`/`TASK-023`'s windowed parity gate has a hole that should be
+closed before those tasks are treated as passing.
+
+## Related gate that is weaker than it looks
+
+Not this task's artifact, but recorded here because a reader deriving confidence from
+`results.json` will see it pass: the **FlashInfer half of the `kv_cache_info_states` check is
+vacuous**. `get_kv_cache_info` reads only the SDPA dict, which is `{}` for FlashInfer, so both
+recorded states are `{0, 0.0}` and compare mode's equality gate passes even if a refactor breaks
+FlashInfer cache accounting entirely. That zero-return is Decision 3's deliberately-preserved bug.
+Details in `_check_get_kv_cache_info`'s docstring.

@@ -236,9 +236,31 @@ class _null_logger:
 def _check_get_kv_cache_info(device: str) -> dict:
     """Item 6: get_kv_cache_info() byte-identity across a few synthetic cache states,
     both backends. No checkpoint needed -- these are Python ints/floats, not model
-    predictions. On Tier 2 (this script's real target), FlashInfer is installed and
-    use_sdpa=False constructs a real manager, so both backends are exercised for real
-    here (unlike Tier 1, which can only run the SDPA half -- see TASK-016's own note).
+    predictions.
+
+    *** The FlashInfer half of this check is VACUOUS BY CONSTRUCTION. ***
+    get_kv_cache_info reads only `aggregator.kv_cache` (gct_stream_window.py:430-448),
+    the SDPA dict. FlashInfer state lives in `aggregator.kv_cache_manager`, which that
+    method never touches, and `_init_kv_cache` populates the k_i/v_i keys only under
+    `if self.use_sdpa:` (stream.py:185-193). For use_sdpa=False the dict is `{}` -- not
+    None, so the early return does not fire -- giving num_cached=0 and 0.0 MB. Both
+    recorded FlashInfer states are therefore {0, 0.0}, before AND after inference.
+
+    That zero-return is Decision 3's documented, deliberately-preserved bug, so this
+    check ASSERTS THE BUG rather than measuring cache stats. Consequence for compare
+    mode (:563): the equality gate compares {0,0.0} to {0,0.0} and passes even if a
+    refactor completely breaks FlashInfer cache accounting. Do not read a passing
+    kv_cache_info_states check as evidence that FlashInfer accounting is intact. A real
+    gate would have to call get_cache_stats(block_idx=0), which does return live
+    FlashInfer numbers -- that is a harness change, not a lingbot_map/ change, and is
+    out of scope while this run must exercise unmodified source.
+
+    Note also the SDPA leg runs fp32 (autocast disabled below is CPU-only, but the model
+    is built without .to(dtype)), while the memory estimate hardcodes 2 bytes/element, so
+    cache_memory_mb is a stable-but-wrong constant. Fine for a byte-identity check.
+
+    On Tier 1 the use_sdpa=False iteration RAISES rather than skipping, since FlashInfer
+    cannot construct there -- this function is Tier-2-only despite recording both legs.
     """
     import torch
     from lingbot_map.models.gct_stream_window import GCTStream
@@ -260,13 +282,17 @@ def _check_get_kv_cache_info(device: str) -> dict:
         # to q.dtype the way the fp32-gather branch does (:383 vs :417-421). Without
         # autocast the bf16 attention output then hits an fp32 attn.proj and raises
         # "mat1 and mat2 must have the same dtype, but got BFloat16 and Float".
-        # This does not perturb the recorded values: get_kv_cache_info returns block
-        # counts and a numel-based estimate that already hardcodes 2 bytes/element
-        # ("Assume bfloat16", gct_stream_window.py:442), so bf16 is what it assumes.
-        # enabled=False on CPU: CPU autocast does not accept float32 as a target dtype,
-        # and the mismatch only arises on the CUDA FlashInfer path anyway.
+        # This does not perturb the recorded values, but NOT because bf16 matches the
+        # memory estimate's assumption -- see the "vacuous for FlashInfer" note in the
+        # docstring above. Autocast does not stop the bf16 return; it makes the consumer
+        # (attn.proj, an autocast-eligible nn.Linear) accept it.
+        # enabled=False on CPU because FlashInfer cannot construct on CPU at all
+        # (flashinfer_cache.py raises when unavailable), so the use_sdpa=False leg cannot
+        # reach the mismatch there, and CPU bf16 autocast would perturb the SDPA leg's
+        # arithmetic for no benefit. Uses .startswith so a "cuda:1"-style device string
+        # does not silently disable autocast and reintroduce the crash.
         with torch.no_grad(), torch.amp.autocast(
-            device, dtype=torch.bfloat16, enabled=(device == "cuda")
+            device, dtype=torch.bfloat16, enabled=str(device).startswith("cuda")
         ):
             model.inference_streaming(images, num_scale_frames=1, keyframe_interval=1)
         states.append(model.get_kv_cache_info())
