@@ -252,7 +252,22 @@ def _check_get_kv_cache_info(device: str) -> dict:
         ).to(device).eval()
         states = [model.get_kv_cache_info()]
         images = torch.rand(1, 5, 3, 98, 98, device=device)
-        with torch.no_grad():
+        # Must run under the SAME autocast the production path uses
+        # (_run_inference below, and demo.py). The model here is built in fp32, but
+        # FlashInferKVCache coerces its storage dtype to bf16 for an fp32 request
+        # (flashinfer_cache.py:125-127, since the FA2 kernel is fp16/bf16-only) and its
+        # paged branch returns kernel output in that storage dtype without casting back
+        # to q.dtype the way the fp32-gather branch does (:383 vs :417-421). Without
+        # autocast the bf16 attention output then hits an fp32 attn.proj and raises
+        # "mat1 and mat2 must have the same dtype, but got BFloat16 and Float".
+        # This does not perturb the recorded values: get_kv_cache_info returns block
+        # counts and a numel-based estimate that already hardcodes 2 bytes/element
+        # ("Assume bfloat16", gct_stream_window.py:442), so bf16 is what it assumes.
+        # enabled=False on CPU: CPU autocast does not accept float32 as a target dtype,
+        # and the mismatch only arises on the CUDA FlashInfer path anyway.
+        with torch.no_grad(), torch.amp.autocast(
+            device, dtype=torch.bfloat16, enabled=(device == "cuda")
+        ):
             model.inference_streaming(images, num_scale_frames=1, keyframe_interval=1)
         states.append(model.get_kv_cache_info())
         key = "sdpa" if use_sdpa else "flashinfer"
@@ -428,8 +443,12 @@ def run_baseline(args) -> dict:
 
     # Items 7/8: Gap A/B preserved, recorded as booleans (must remain the same value
     # in compare mode).
+    # Flushed separately: sharing one checkpoint means a failure in gap B discards a
+    # completed gap A, which is the same loss mode the per-stage flush exists to prevent.
     results["checks"]["gap_a_preserved"] = {"pass": True, "value": _check_gap_a()}
+    _checkpoint("gap_a_preserved")
     results["checks"]["gap_b_preserved"] = {"pass": True, "value": _check_gap_b()}
+    _checkpoint("gap_b_preserved")
 
     _checkpoint("complete")
     return results
