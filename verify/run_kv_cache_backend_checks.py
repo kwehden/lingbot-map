@@ -54,6 +54,53 @@ _DEFAULT_TOL = {
 
 _OUTPUT_KEYS = ["pose_enc", "depth", "depth_conf", "world_points", "world_points_conf"]
 
+# inference_windowed emits three MORE outputs that _OUTPUT_KEYS does not name, and that
+# earlier revisions of this harness therefore never diffed: the cross-window alignment
+# metadata attached by _merge_and_align (gct_stream_window.py:951-955).
+#
+# These are the numerics MOST exposed to a KV-cache refactor in windowed mode -- they are
+# derived from _pairwise_alignment over each window's overlap region, so they depend on
+# per-window cache state directly, whereas pose_enc/depth are per-frame. Leaving them
+# ungated meant windowed parity could pass while cross-window alignment silently drifted.
+#
+# alignment_mode is a STRING ("scaled"), not a tensor -- _values_close below dispatches on
+# type rather than assuming tensors, so it is compared by equality.
+#
+# Deliberately NOT included: `images`. Both inference paths echo the input images back
+# (gct_stream_window.py:659) as a visualization payload; it is model *input*, not a
+# prediction, so a diff there could only ever report a harness bug, at ~1.6GB of tensor
+# comparison per config.
+_ALIGNMENT_KEYS = ["chunk_scales", "chunk_transforms", "alignment_mode"]
+
+# Discrete per-frame decision outputs, present in BOTH inference paths and likewise never
+# previously diffed. Found by inspecting a real staged baseline artifact rather than by
+# reading the return annotations -- both are emitted but neither appears in _OUTPUT_KEYS.
+#
+#   is_keyframe  [B, S] bool  -- whether each frame's KV was retained in cache
+#   frame_type   [B, S] uint8 -- scale-frame vs. sliding-window frame classification
+#
+# These matter more than their size suggests: they ARE the keyframe-decision sequence, and
+# the refactor moves exactly the machinery that produces them (_set_skip_append,
+# _defer_eviction, rollback_last_frame, execute_deferred_eviction). A refactor that changed
+# which frames get cached would alter these while potentially leaving pose_enc/depth within
+# tolerance -- a silent behavioral change in the cache policy itself.
+#
+# This is design.md's Verification Strategy item 3 (keyframe-decision-sequence identity),
+# which the module docstring defers to TASK-023 as a separate run. The staged baseline
+# already contains these tensors, so gating them here costs nothing and closes item 3 for
+# the two inference entry points this harness drives. It does NOT subsume all of TASK-023,
+# which also covers flow-threshold-driven decisions this harness never exercises.
+#
+# Compared EXACTLY, not at rtol/atol: a keyframe decision is a discrete choice, so "close"
+# is not a meaningful relaxation -- one flipped frame is a real divergence.
+_EXACT_KEYS = ["is_keyframe", "frame_type"]
+
+# What compare mode actually diffs. Streaming configs do not emit the alignment keys, so
+# for them these land in the absent-in-both branch (parity, close=True) -- which also
+# usefully guards the reverse direction: if a refactor ever started emitting alignment
+# metadata from the streaming path, present-in-one-only would flag it.
+_COMPARED_KEYS = _OUTPUT_KEYS + _ALIGNMENT_KEYS + _EXACT_KEYS
+
 # (mode, use_sdpa) combinations item 1/2 both require -- FlashInfer is the default
 # (use_sdpa=False); force_fp32 is FlashInfer-only per context.md's Glossary, so it is
 # only exercised as a third configuration, not crossed with mode.
@@ -236,9 +283,43 @@ class _null_logger:
 def _check_get_kv_cache_info(device: str) -> dict:
     """Item 6: get_kv_cache_info() byte-identity across a few synthetic cache states,
     both backends. No checkpoint needed -- these are Python ints/floats, not model
-    predictions. On Tier 2 (this script's real target), FlashInfer is installed and
-    use_sdpa=False constructs a real manager, so both backends are exercised for real
-    here (unlike Tier 1, which can only run the SDPA half -- see TASK-016's own note).
+    predictions.
+
+    *** The `get_kv_cache_info` half of this check is VACUOUS FOR FLASHINFER. ***
+    get_kv_cache_info reads only `aggregator.kv_cache` (gct_stream_window.py:430-448),
+    the SDPA dict. FlashInfer state lives in `aggregator.kv_cache_manager`, which that
+    method never touches, and `_init_kv_cache` populates the k_i/v_i keys only under
+    `if self.use_sdpa:` (stream.py:185-193). For use_sdpa=False the dict is `{}` -- not
+    None, so the early return does not fire -- giving num_cached=0 and 0.0 MB. Both
+    recorded FlashInfer states are therefore {0, 0.0}, before AND after inference.
+    (Confirmed on hardware by baseline job 16, which recorded exactly that.)
+
+    That zero-return is Decision 3's documented, deliberately-preserved bug, so the
+    `states` half of this check ASSERTS THE BUG rather than measuring cache stats. On its
+    own it is a tautology for FlashInfer: comparing {0,0.0} to {0,0.0} passes even if a
+    refactor completely breaks FlashInfer cache accounting.
+
+    *** `flashinfer_cache_stats` is the non-vacuous companion gate. ***
+    `FlashInferKVCacheManager.get_cache_stats` (flashinfer_cache.py:303 pre-refactor,
+    :324 post-refactor) DOES return live per-block occupancy -- frame_count, scale_pages,
+    live_pages, free_pages, special_tokens. It exists with an identical signature and
+    identical return keys on both refs, so its output is directly diffable across the
+    refactor. Recorded here for every block, after inference, so compare mode has a real
+    equality gate on FlashInfer accounting instead of only the zero-return assertion.
+
+    This is a harness-side probe: it calls an existing public read-only method and does
+    not modify lingbot_map/, so it is compatible with the requirement that these runs
+    exercise unmodified source. The SDPA leg deliberately does NOT get the same treatment
+    -- pre-refactor SDPA has no get_cache_stats at all (it is a bare dict), so there is no
+    cross-ref-comparable call to make; its get_kv_cache_info numbers are already live and
+    non-vacuous (job 16: 24 blocks / 25.78 MB), which is why only FlashInfer needed this.
+
+    Note also the SDPA leg runs fp32 (autocast disabled below is CPU-only, but the model
+    is built without .to(dtype)), while the memory estimate hardcodes 2 bytes/element, so
+    cache_memory_mb is a stable-but-wrong constant. Fine for a byte-identity check.
+
+    On Tier 1 the use_sdpa=False iteration RAISES rather than skipping, since FlashInfer
+    cannot construct there -- this function is Tier-2-only despite recording both legs.
     """
     import torch
     from lingbot_map.models.gct_stream_window import GCTStream
@@ -252,11 +333,45 @@ def _check_get_kv_cache_info(device: str) -> dict:
         ).to(device).eval()
         states = [model.get_kv_cache_info()]
         images = torch.rand(1, 5, 3, 98, 98, device=device)
-        with torch.no_grad():
+        # Must run under the SAME autocast the production path uses
+        # (_run_inference below, and demo.py). The model here is built in fp32, but
+        # FlashInferKVCache coerces its storage dtype to bf16 for an fp32 request
+        # (flashinfer_cache.py:125-127, since the FA2 kernel is fp16/bf16-only) and its
+        # paged branch returns kernel output in that storage dtype without casting back
+        # to q.dtype the way the fp32-gather branch does (:383 vs :417-421). Without
+        # autocast the bf16 attention output then hits an fp32 attn.proj and raises
+        # "mat1 and mat2 must have the same dtype, but got BFloat16 and Float".
+        # This does not perturb the recorded values, but NOT because bf16 matches the
+        # memory estimate's assumption -- see the "vacuous for FlashInfer" note in the
+        # docstring above. Autocast does not stop the bf16 return; it makes the consumer
+        # (attn.proj, an autocast-eligible nn.Linear) accept it.
+        # enabled=False on CPU because FlashInfer cannot construct on CPU at all
+        # (flashinfer_cache.py raises when unavailable), so the use_sdpa=False leg cannot
+        # reach the mismatch there, and CPU bf16 autocast would perturb the SDPA leg's
+        # arithmetic for no benefit. Uses .startswith so a "cuda:1"-style device string
+        # does not silently disable autocast and reintroduce the crash.
+        with torch.no_grad(), torch.amp.autocast(
+            device, dtype=torch.bfloat16, enabled=str(device).startswith("cuda")
+        ):
             model.inference_streaming(images, num_scale_frames=1, keyframe_interval=1)
         states.append(model.get_kv_cache_info())
         key = "sdpa" if use_sdpa else "flashinfer"
         results[key] = states
+
+        # Real FlashInfer occupancy, to escape the tautology documented above. Guarded
+        # rather than assumed: the manager is lazily constructed (stream.py:207-215), so a
+        # future change that stopped constructing it must surface as an explicit
+        # unavailable marker -- which will FAIL compare mode's equality gate against a
+        # baseline that recorded real numbers -- rather than silently vanish from results.
+        if not use_sdpa:
+            mgr = getattr(model.aggregator, "kv_cache_manager", None)
+            if mgr is None or not hasattr(mgr, "get_cache_stats"):
+                results["flashinfer_cache_stats"] = {"unavailable": True}
+            else:
+                results["flashinfer_cache_stats"] = {
+                    str(i): mgr.get_cache_stats(block_idx=i)
+                    for i in range(mgr.num_blocks)
+                }
     return results
 
 
@@ -306,21 +421,83 @@ def _free_cuda() -> None:
         torch.cuda.empty_cache()
 
 
-def _tensor_dict_close(a: dict, b: dict, tol: dict) -> dict:
+def _values_close(va, vb, tol: dict, exact: bool = False) -> dict:
+    """Compare one prediction value, dispatching on type.
+
+    Most values are tensors, but inference_windowed's `alignment_mode` is a plain string,
+    and a tensor-only implementation would raise AttributeError on `.float()` the moment
+    the alignment keys were added to the compared set. Non-tensor values are compared by
+    equality -- for a mode flag, exact equality is the correct gate anyway: a refactor
+    that silently switched windowed inference from "scaled" to any other alignment mode is
+    a divergence no numeric tolerance should absorb.
+
+    `exact=True` (used for _EXACT_KEYS) demands element-wise equality instead of allclose.
+    Necessary for the bool/uint8 decision tensors: allclose on a bool tensor would compare
+    True against 1.0009 as "close", which is meaningless for a discrete decision, and the
+    count of differing frames is the useful diagnostic rather than a max-abs magnitude.
+    """
+    import torch
+
+    if not (torch.is_tensor(va) and torch.is_tensor(vb)):
+        return {"close": bool(va == vb), "non_tensor": True,
+                "baseline_value": str(va), "compare_value": str(vb)}
+
+    if exact:
+        if va.shape != vb.shape:
+            return {"close": False, "shape_mismatch": True, "exact": True,
+                    "baseline_shape": list(va.shape), "compare_shape": list(vb.shape)}
+        ne = (va != vb)
+        n_diff = int(ne.sum().item())
+        detail = {"close": n_diff == 0, "exact": True, "num_differing": n_diff,
+                  "num_elements": int(va.numel())}
+        if n_diff:
+            # Name the first few offending frame indices -- for a decision sequence, WHICH
+            # frames flipped is the whole diagnostic, and a bare count would send the
+            # reader back to the raw tensors.
+            detail["first_differing_indices"] = (
+                ne.nonzero(as_tuple=False)[:10].tolist())
+        return detail
+
+    # Shape mismatch is a real divergence, and allclose would raise on non-broadcastable
+    # shapes rather than report. chunk_scales/chunk_transforms are shaped by the *window
+    # count*, so a refactor that changed windowing would land here -- exactly the class of
+    # bug this gate is being added to catch.
+    if va.shape != vb.shape:
+        return {"close": False, "shape_mismatch": True,
+                "baseline_shape": list(va.shape), "compare_shape": list(vb.shape)}
+
+    ta, tb = va.float(), vb.float()
+    diff = (ta - tb).abs()
+    denom = tb.abs()
+    # Decision 4 step 2 asks for max absolute AND max relative difference per key; earlier
+    # revisions recorded only max_abs. Relative is computed only where the denominator is
+    # nonzero -- 0/0 is parity, not infinite error.
+    nonzero = denom > 0
+    max_rel = (diff[nonzero] / denom[nonzero]).max().item() if nonzero.any() else 0.0
+    return {
+        "close": bool(torch.allclose(ta, tb, rtol=tol["rtol"], atol=tol["atol"])),
+        "max_abs_diff": diff.max().item(),
+        "max_rel_diff": max_rel,
+    }
+
+
+def _tensor_dict_close(a: dict, b: dict, tol: dict, keys=None) -> dict:
     """Per-key parity between two prediction dicts.
 
     _OUTPUT_KEYS lists every key the model *can* emit, but which are actually present
     depends on the model config: world_points/world_points_conf only exist when
     enable_point=True, and the production pipeline (benchmark/methods/lingbot_map.py and
     demo.py) leaves enable_point at its False default, so those two keys are legitimately
-    absent from both runs. A key absent from BOTH is parity -- same before and after the
-    refactor -- so it counts as close=True. A key present in one run but not the other IS
-    a real divergence (the refactor added or dropped an output) and stays close=False, so
-    callers' `all(v["close"] for ...)` aggregation still catches that case.
+    absent from both runs. Likewise the _ALIGNMENT_KEYS are windowed-only. A key absent
+    from BOTH is parity -- same before and after the refactor -- so it counts as
+    close=True. A key present in one run but not the other IS a real divergence (the
+    refactor added or dropped an output) and stays close=False, so callers'
+    `all(v["close"] for ...)` aggregation still catches that case.
+
+    `keys` defaults to _COMPARED_KEYS (named outputs + windowed alignment metadata).
     """
-    import torch
     diffs = {}
-    for key in _OUTPUT_KEYS:
+    for key in (keys if keys is not None else _COMPARED_KEYS):
         in_a, in_b = key in a, key in b
         if not in_a and not in_b:
             diffs[key] = {"close": True, "absent_both": True}
@@ -332,10 +509,7 @@ def _tensor_dict_close(a: dict, b: dict, tol: dict) -> dict:
                 "present_compare": in_b,
             }
             continue
-        ta, tb = a[key].float(), b[key].float()
-        close = torch.allclose(ta, tb, rtol=tol["rtol"], atol=tol["atol"])
-        max_abs = (ta - tb).abs().max().item()
-        diffs[key] = {"close": bool(close), "max_abs_diff": max_abs}
+        diffs[key] = _values_close(a[key], b[key], tol, exact=key in _EXACT_KEYS)
     return diffs
 
 
@@ -428,8 +602,12 @@ def run_baseline(args) -> dict:
 
     # Items 7/8: Gap A/B preserved, recorded as booleans (must remain the same value
     # in compare mode).
+    # Flushed separately: sharing one checkpoint means a failure in gap B discards a
+    # completed gap A, which is the same loss mode the per-stage flush exists to prevent.
     results["checks"]["gap_a_preserved"] = {"pass": True, "value": _check_gap_a()}
+    _checkpoint("gap_a_preserved")
     results["checks"]["gap_b_preserved"] = {"pass": True, "value": _check_gap_b()}
+    _checkpoint("gap_b_preserved")
 
     _checkpoint("complete")
     return results
@@ -449,6 +627,108 @@ def run_compare(args) -> dict:
 
     results = {"mode": "compare", "checks": {}}
     all_pass = True
+
+    # Compare mode gets the same per-stage flush baseline mode has. It did not before: the
+    # checkpointing added after job 10 lost 33 GPU-minutes was applied only to run_baseline,
+    # while run_compare still wrote results.json exactly once, at the very end -- so any
+    # late failure discarded every completed comparison. That is the identical loss mode,
+    # and compare mode is the run whose *findings* (not just measurements) would be lost.
+    #
+    # `pass` is written on every flush so a partial results.json is still interpretable,
+    # with `complete: False` marking that not all stages ran. A reader must not mistake a
+    # partial all_pass=True for a clean run.
+    def _flush(stage: str, complete: bool = False) -> None:
+        results["pass"] = all_pass
+        results["complete"] = complete
+        (output_dir / "results.json").write_text(json.dumps(results, indent=2))
+        print(f"[run_compare] checkpointed results.json after stage: {stage} "
+              f"(all_pass so far: {all_pass})", flush=True)
+
+    # Cheap stages FIRST. Items 6/7/8 build only tiny synthetic models (98px and 42px) and
+    # cost seconds; items 1/2 cost ~40 GPU-minutes. Running the cheap ones last is how job
+    # 15 died: it burned the full inference budget and then crashed in the item-6 stage,
+    # losing everything. Front-loading them means a defect in that code path surfaces in the
+    # first minute, and a spot preemption during the expensive stages still leaves the cheap
+    # verdicts already flushed to S3.
+    #
+    # Ordering is safe: these three stages share no state with items 1/2 -- separate models,
+    # no checkpoint, no fixture -- so the only coupling is GPU memory, and each frees its
+    # own before returning.
+
+    # Item 6: get_kv_cache_info byte-identity vs baseline's recorded states.
+    #
+    # Compared per sub-key rather than with a single `==` on the whole dict. This harness
+    # now records `flashinfer_cache_stats` alongside the two `get_kv_cache_info` state
+    # lists, and the staged baseline (job 16) predates that probe, so a whole-dict equality
+    # would report FAIL purely because the compare side carries an extra key -- a spurious
+    # failure that says nothing about the refactor. Sub-key comparison also localizes a
+    # genuine failure to the backend that caused it.
+    kv_info_states = _check_get_kv_cache_info(device)
+
+    # A dedicated pre-refactor probe run (--mode kv_info_probe against the baseline ref)
+    # can supply baseline values for keys the staged baseline never recorded. Falls back to
+    # the staged baseline's own values when absent.
+    baseline_kv_states = dict(
+        baseline_results["checks"]["kv_cache_info_states"]["values"])
+    probe_source = "staged_baseline"
+    if args.kv_info_baseline:
+        probe_path = Path(args.kv_info_baseline)
+        if probe_path.is_file():
+            probe = json.loads(probe_path.read_text())
+            probe_values = probe.get("kv_cache_info_states", probe)
+            for k, v in probe_values.items():
+                baseline_kv_states.setdefault(k, v)
+            probe_source = f"{probe_path.name}+staged_baseline"
+        else:
+            probe_source = "staged_baseline (probe file absent)"
+
+    kv_detail = {}
+    kv_pass = True
+    for subkey, compare_value in kv_info_states.items():
+        if subkey not in baseline_kv_states:
+            # Recorded for the NEXT baseline to compare against, but explicitly not
+            # counted as a pass -- there is nothing to compare it to this run. Not counted
+            # as a failure either: an absent baseline is a coverage gap, not evidence of a
+            # regression, and failing here would make an unrelated refactor look broken.
+            kv_detail[subkey] = {
+                "pass": None, "no_baseline": True, "compare": compare_value,
+                "note": ("no baseline recorded for this sub-check; value stored as a "
+                         "forward baseline. NOT verified this run."),
+            }
+            continue
+        match = compare_value == baseline_kv_states[subkey]
+        kv_pass = kv_pass and match
+        kv_detail[subkey] = {
+            "pass": bool(match),
+            "baseline": baseline_kv_states[subkey],
+            "compare": compare_value,
+        }
+    all_pass = all_pass and kv_pass
+    results["checks"]["kv_cache_info_byte_identical"] = {
+        "pass": bool(kv_pass),
+        "baseline_source": probe_source,
+        "per_subcheck": kv_detail,
+        # Surfaced at the top level so a reader of results.json cannot mistake a passing
+        # `pass` for full coverage when some sub-checks had no baseline.
+        "unverified_subchecks": [
+            k for k, v in kv_detail.items() if v.get("no_baseline")],
+    }
+    _flush("kv_cache_info_byte_identical")
+    _free_cuda()
+
+    # Items 7/8: Gap A/B preservation must match baseline's recorded value exactly.
+    gap_a = _check_gap_a()
+    gap_a_pass = gap_a == baseline_results["checks"]["gap_a_preserved"]["value"]
+    all_pass = all_pass and gap_a_pass
+    results["checks"]["gap_a_preserved"] = {"pass": bool(gap_a_pass), "value": gap_a}
+    _flush("gap_a_preserved")
+
+    gap_b = _check_gap_b()
+    gap_b_pass = gap_b == baseline_results["checks"]["gap_b_preserved"]["value"]
+    all_pass = all_pass and gap_b_pass
+    results["checks"]["gap_b_preserved"] = {"pass": bool(gap_b_pass), "value": gap_b}
+    _flush("gap_b_preserved")
+    _free_cuda()
 
     images = _load_demo_images(tum_root, args.scene)
 
@@ -473,6 +753,8 @@ def run_compare(args) -> dict:
         passed = all(v.get("close", False) for v in diff.values())
         all_pass = all_pass and passed
         demo_check[tag] = {"pass": passed, "diff": diff}
+        results["checks"]["demo_parity"] = demo_check
+        _flush(f"demo_parity:{tag}")
         del model, run, baseline_pred
         _free_cuda()
     results["checks"]["demo_parity"] = demo_check
@@ -497,6 +779,7 @@ def run_compare(args) -> dict:
     results["checks"]["demo_parity"]["streaming_flashinfer_fp32"] = {
         "pass": passed, "diff": diff,
     }
+    _flush("demo_parity:streaming_flashinfer_fp32")
     del model, run, baseline_pred
     _free_cuda()
 
@@ -534,50 +817,71 @@ def run_compare(args) -> dict:
         )
         harness_check[tag] = {"pass": bool(depth_close), "tol": harness_tol}
         all_pass = all_pass and depth_close
+        results["checks"]["harness_parity"] = harness_check
+        _flush(f"harness_parity:{tag}")
         del output, baseline_output
         _free_cuda()
     results["checks"]["harness_parity"] = harness_check
 
-    # Item 6: get_kv_cache_info byte-identity vs baseline's recorded states.
-    kv_info_states = _check_get_kv_cache_info(device)
-    baseline_kv_states = baseline_results["checks"]["kv_cache_info_states"]["values"]
-    kv_pass = kv_info_states == baseline_kv_states
-    all_pass = all_pass and kv_pass
-    results["checks"]["kv_cache_info_byte_identical"] = {
-        "pass": bool(kv_pass), "baseline": baseline_kv_states, "compare": kv_info_states,
-    }
+    # Items 6/7/8 already ran, at the TOP of this function -- see the "Cheap stages FIRST"
+    # note there. They are deliberately not repeated here.
 
-    # Items 7/8: Gap A/B preservation must match baseline's recorded value exactly.
-    gap_a = _check_gap_a()
-    gap_a_pass = gap_a == baseline_results["checks"]["gap_a_preserved"]["value"]
-    all_pass = all_pass and gap_a_pass
-    results["checks"]["gap_a_preserved"] = {"pass": bool(gap_a_pass), "value": gap_a}
-
-    gap_b = _check_gap_b()
-    gap_b_pass = gap_b == baseline_results["checks"]["gap_b_preserved"]["value"]
-    all_pass = all_pass and gap_b_pass
-    results["checks"]["gap_b_preserved"] = {"pass": bool(gap_b_pass), "value": gap_b}
-
-    results["pass"] = all_pass
-    (output_dir / "results.json").write_text(json.dumps(results, indent=2))
+    _flush("complete", complete=True)
     return results
+
+
+def run_kv_info_probe(args) -> dict:
+    """Record ONLY the item-6 cache-state block, against whatever ref is checked out.
+
+    Exists so the new `flashinfer_cache_stats` gate can get a pre-refactor baseline without
+    re-running the full ~40-minute baseline: this path builds only tiny synthetic 98px
+    models and needs no checkpoint or TUM fixture, so it costs GPU seconds, not minutes.
+    Run it against the baseline ref, keep the JSON, and feed it to compare mode via
+    --kv_info_baseline.
+    """
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    values = _check_get_kv_cache_info(device)
+    payload = {"mode": "kv_info_probe", "kv_cache_info_states": values}
+    (output_dir / "kv_info_probe.json").write_text(json.dumps(payload, indent=2))
+    print(f"[run_kv_info_probe] {json.dumps(values, indent=2)}", flush=True)
+    return payload
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["baseline", "compare"], required=True)
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--tum_root", required=True)
-    parser.add_argument("--scene", required=True)
+    parser.add_argument("--mode",
+                        choices=["baseline", "compare", "kv_info_probe"], required=True)
+    # Not required for kv_info_probe: that mode builds only tiny synthetic models and
+    # touches neither the checkpoint nor the fixture.
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--tum_root", default=None)
+    parser.add_argument("--scene", default=None)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--baseline_dir", default=None,
                          help="Required for --mode compare")
+    parser.add_argument("--kv_info_baseline", default=None,
+                         help="Optional kv_info_probe.json from the baseline ref, "
+                              "supplying baseline values for item-6 sub-checks the "
+                              "staged baseline predates (e.g. flashinfer_cache_stats).")
     args = parser.parse_args()
 
     if args.mode == "compare" and not args.baseline_dir:
         parser.error("--baseline_dir is required for --mode compare")
+    if args.mode in ("baseline", "compare"):
+        missing = [n for n in ("checkpoint", "tum_root", "scene")
+                   if getattr(args, n) is None]
+        if missing:
+            parser.error(
+                f"--mode {args.mode} requires: {', '.join('--' + m for m in missing)}")
 
-    if args.mode == "baseline":
+    if args.mode == "kv_info_probe":
+        run_kv_info_probe(args)
+        sys.exit(0)
+    elif args.mode == "baseline":
         results = run_baseline(args)
         # Baseline mode has no pass/fail semantics of its own (per TASK-027's own
         # framing) -- it always "succeeds" if it completes and records numbers.
