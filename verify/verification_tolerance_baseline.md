@@ -1,5 +1,17 @@
 # Numerical-tolerance baseline for the `KVCacheBackend` refactor
 
+> **OUTCOME (2026-08-01): the tolerances derived below were never approached — the refactor is
+> bit-exact.** Compare mode (job 21, `SUCCEEDED`, 29m36s) diffed all five configurations against
+> this baseline and every `max_abs_diff` **and** `max_rel_diff` came back exactly `0.0`, with the
+> windowed keyframe-decision sequence identical on all 613 frames (`differing=0/613`) and
+> `alignment_mode` unchanged. The gate was therefore never the binding constraint.
+>
+> Keep the derivation on record regardless: it is what makes "0.0" a *verified* result rather than
+> an unexamined one, and any future change that does perturb numerics will need it. The coverage
+> caveats below still apply — bit-exactness is established for the keys that are **gated**, and the
+> cross-window alignment and keyframe-decision keys only became gated in the run that produced this
+> outcome (they had been saved to these baseline artifacts and silently never compared).
+
 **Status:** measured and retained. Partial pass — 3 of 5 output keys (see
 [Coverage gap](#coverage-gap--3-of-5-output-keys)).
 **Task:** `TASK-003` ("Derive the numerical-tolerance acceptance gate from the unmodified-code
@@ -139,12 +151,32 @@ mode:
 
 `chunk_scales` / `chunk_transforms` are the **cross-window alignment outputs** — arguably the
 numerics most exposed to a KV-cache refactor in windowed mode, since they depend on per-window state.
-They have no measured noise floor and no parity gate. So the honest statement of coverage is: **3 of
-5 named keys, plus 3 unnamed windowed keys with no gate at all.**
 
-Whether that omission is intentional is an open question for the tech lead. If it is deliberate,
-record why here; if not, `TASK-021`/`TASK-023`'s windowed parity gate has a hole that should be
-closed before those tasks are treated as passing.
+**RESOLVED 2026-08-01 — this hole is now closed.** The omission was not intentional; it was an
+oversight, found by loading a real staged `.pt` and listing its keys rather than reading the return
+annotations. Compare mode now diffs all three (`_ALIGNMENT_KEYS`), and inspecting the artifacts
+turned up **two more** ungated outputs that `_OUTPUT_KEYS` never named:
+
+- **`is_keyframe`** `[1, 613]` (bool) and **`frame_type`** `[1, 613]` (uint8) — the **keyframe
+  decision sequence**, produced by exactly the machinery this refactor moves (`_set_skip_append`,
+  `_defer_eviction`, `rollback_last_frame`, `execute_deferred_eviction`). Gated as `_EXACT_KEYS`,
+  compared element-wise rather than at `rtol`/`atol`: a keyframe decision is discrete, so "close"
+  is meaningless, and *which* frames flipped is the useful diagnostic. This closes `design.md`
+  verification **item 3** for the two entry points this harness drives — not all of `TASK-023`,
+  which also covers flow-threshold-driven decisions never exercised here.
+
+These keys had a measured floor of 0.0 available all along (the tensors were in the baseline
+artifacts), so closing the gate required **no baseline re-run**. Job 21 reports parity on every one
+of them. The gates were validated by perturbation against the real artifact: changing only
+`chunk_scales`, or flipping one keyframe decision out of 613, now FAILS — and the old five-key gate
+demonstrably PASSED both.
+
+The same oversight existed in the **item 2 harness comparison**, which checked only `depth` while
+the output carries `depth`, `pose`, `intrinsics` and `confidence` (613 ndarrays each). 613 camera
+poses per config were ungated — a wider hole than this one, since pose is the primary output of a
+reconstruction model. Now gated per key; validated by confirming a single perturbed camera pose
+fails and names the frame, where the depth-only check reported PASS. That fix landed after job 21
+launched, so it applies to the next run.
 
 ## Related gate that is weaker than it looks
 
