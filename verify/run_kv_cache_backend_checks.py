@@ -821,17 +821,63 @@ def run_compare(args) -> dict:
                 else _DEFAULT_TOL["bf16"]["atol"],
             ),
         }
-        # LingbotMapMethod.process_scene() returns {'frame': {...lists...}, 'global': {}};
-        # compare depth lists element-wise at the same tolerance as demo_parity.
-        b_depth = baseline_output["frame"]["depth"]
-        c_depth = output["frame"]["depth"]
-        depth_close = len(b_depth) == len(c_depth) and all(
-            abs(bd - cd).max()
-            <= harness_tol["atol"] + harness_tol["rtol"] * abs(bd).max()
-            for bd, cd in zip(b_depth, c_depth)
-        )
-        harness_check[tag] = {"pass": bool(depth_close), "tol": harness_tol}
-        all_pass = all_pass and depth_close
+        # LingbotMapMethod.process_scene() returns {'frame': {...lists of ndarray...},
+        # 'global': {}}. Compare every PREDICTED per-frame key element-wise, at the same
+        # tolerance as demo_parity.
+        #
+        # Earlier revisions compared only 'depth', which left the most important output of a
+        # reconstruction model ungated: 'pose' is 613 camera poses per config, and
+        # 'confidence' 613 confidence maps, all of which this refactor's KV-cache changes
+        # could perturb. Verified against the real staged artifact
+        # (harness_windowed_flashinfer.pt): frame carries rgb, depth, pose, intrinsics,
+        # confidence -- each a 613-element list of ndarrays.
+        #
+        # 'rgb' is excluded: it is the input imagery echoed back, not a prediction, so a
+        # difference there could only indicate a harness/loader bug, and it is the largest
+        # payload by far (613 x 378 x 518 x 3). 'intrinsics' IS included -- it is small, and
+        # while it should be a pure function of the fixture, that is an assumption worth
+        # gating rather than trusting.
+        _HARNESS_KEYS = ("depth", "pose", "intrinsics", "confidence")
+        per_key = {}
+        for hk in _HARNESS_KEYS:
+            b_list = baseline_output["frame"].get(hk)
+            c_list = output["frame"].get(hk)
+            if b_list is None and c_list is None:
+                per_key[hk] = {"close": True, "absent_both": True}
+                continue
+            if (b_list is None) != (c_list is None):
+                per_key[hk] = {"close": False, "present_baseline": b_list is not None,
+                               "present_compare": c_list is not None}
+                continue
+            if len(b_list) != len(c_list):
+                per_key[hk] = {"close": False, "length_mismatch": True,
+                               "baseline_len": len(b_list), "compare_len": len(c_list)}
+                continue
+            # Track the worst per-frame deviation so a FAIL says how far off it was, and a
+            # PASS records the margin, instead of only a boolean.
+            worst = 0.0
+            worst_frame = -1
+            bad = 0
+            for i, (bd, cd) in enumerate(zip(b_list, c_list)):
+                if getattr(bd, "shape", None) != getattr(cd, "shape", None):
+                    bad += 1
+                    if worst_frame < 0:
+                        worst_frame = i
+                    continue
+                d = abs(bd - cd).max()
+                lim = harness_tol["atol"] + harness_tol["rtol"] * abs(bd).max()
+                if d > lim:
+                    bad += 1
+                if d > worst:
+                    worst, worst_frame = float(d), i
+            per_key[hk] = {"close": bad == 0, "num_frames": len(b_list),
+                           "num_frames_over_tol": bad,
+                           "max_abs_diff": worst, "worst_frame": worst_frame}
+
+        harness_pass = all(v["close"] for v in per_key.values())
+        harness_check[tag] = {"pass": bool(harness_pass), "tol": harness_tol,
+                              "per_key": per_key}
+        all_pass = all_pass and harness_pass
         results["checks"]["harness_parity"] = harness_check
         _flush(f"harness_parity:{tag}")
         del output, baseline_output
