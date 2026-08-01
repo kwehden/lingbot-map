@@ -911,14 +911,24 @@ def run_kv_info_probe(args) -> dict:
     #
     # This matters more than it looks. The Tier 2 worker `pip install -e`s the checkout at
     # ~/lingbot-map, so `import lingbot_map` resolves through that editable install. Running
-    # this script from inside a *different* clone does NOT override it: sys.path[0] for a
-    # script is the script's own directory (<clone>/verify), not the clone root. So a probe
-    # intended to measure the BASELINE ref would silently import and measure the REFACTOR
-    # code, and record the result as a baseline -- a false reference of exactly the kind
-    # that makes every downstream comparison meaningless while looking perfectly healthy.
+    # this script from inside a *different* clone does NOT override it, and neither does
+    # PYTHONPATH -- verified empirically, not assumed:
     #
-    # Callers must therefore set PYTHONPATH to the clone root, and pass
-    # --expect_module_root to have that actually verified rather than assumed.
+    #   `pip install -e` drops a .pth that registers an `_EditableFinder` on sys.meta_path,
+    #   and meta_path finders are consulted BEFORE the sys.path-based PathFinder. So the
+    #   editable install beats PYTHONPATH and cwd both. (sys.path[0] for a script is also
+    #   the script's own directory, <clone>/verify, not the clone root -- but that is the
+    #   lesser of the two reasons.)
+    #
+    # A probe intended to measure the BASELINE ref would therefore silently import and
+    # measure the REFACTOR code and record it as a baseline -- a false reference of exactly
+    # the kind that makes every downstream comparison meaningless while looking healthy.
+    #
+    # To actually select the code under measurement, re-point the editable install:
+    #     pip install -e <baseline-clone> --no-deps   # --no-deps: do not touch the pins
+    #     <run this probe>
+    #     pip install -e <refactor-checkout> --no-deps
+    # and pass --expect_module_root so that selection is VERIFIED rather than assumed.
     module_root = str(Path(lingbot_map.__file__).resolve().parent.parent)
     print(f"[run_kv_info_probe] imported lingbot_map from: {module_root}", flush=True)
     if args.expect_module_root:
@@ -927,8 +937,10 @@ def run_kv_info_probe(args) -> dict:
             raise RuntimeError(
                 f"Refusing to record a probe from the wrong checkout: imported "
                 f"lingbot_map from {module_root!r} but --expect_module_root is "
-                f"{expected!r}. Set PYTHONPATH to the intended clone root. Recording this "
-                f"as a baseline would silently compare the refactor against itself."
+                f"{expected!r}. Note PYTHONPATH CANNOT fix this -- an editable install's "
+                f"meta_path finder wins over sys.path. Re-point the editable install "
+                f"(`pip install -e {expected} --no-deps`) instead. Recording this as a "
+                f"baseline would silently compare the refactor against itself."
             )
 
     values = _check_get_kv_cache_info(device)
@@ -958,7 +970,9 @@ def main():
     parser.add_argument("--expect_module_root", default=None,
                          help="For --mode kv_info_probe: assert that `import lingbot_map` "
                               "resolves inside this directory, so a probe cannot silently "
-                              "measure a different checkout than intended.")
+                              "measure a different checkout than intended. Select the "
+                              "checkout by re-pointing the editable install, NOT with "
+                              "PYTHONPATH (which an editable install overrides).")
     args = parser.parse_args()
 
     if args.mode == "compare" and not args.baseline_dir:
