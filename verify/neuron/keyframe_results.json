@@ -1,0 +1,140 @@
+{
+  "suite": "neuron C3 keyframe_decision vs GPU original (design.md V4a)",
+  "device": "cuda",
+  "reference": "REAL gct_stream_window._compute_flow_magnitude + inline branch :575-587",
+  "config": {
+    "flow_threshold": 3.0,
+    "max_non_keyframe_gap": 8,
+    "scale_frames": 8,
+    "n_frames": 60,
+    "stride": 8
+  },
+  "keyframe_sequence": [
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    1,
+    0,
+    0
+  ],
+  "min_threshold_margin": 0.020781517028808594,
+  "n_checks": 10,
+  "n_fail": 0,
+  "verdict": "PASS",
+  "results": [
+    {
+      "check": "device",
+      "pass": true,
+      "device": "cuda",
+      "gpu": "NVIDIA A10G"
+    },
+    {
+      "check": "flow_magnitude_matches_original_bitwise",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "n": 60,
+      "detail": "same ops in the same order -> exact, not merely close"
+    },
+    {
+      "check": "empty_valid_mask_returns_zero_not_nan",
+      "pass": true,
+      "ref": 0.0,
+      "got": 0.0,
+      "detail": "torch.where replaces `if valid_count < 1: return 0.0`; the clamped divisor keeps the discarded branch finite so the select cannot propagate nan"
+    },
+    {
+      "check": "keyframe_sequence_identical_to_gpu",
+      "pass": true,
+      "n_frames": 52,
+      "n_keyframes": 19,
+      "n_non_keyframes": 33,
+      "first_divergence": null,
+      "detail": "element-for-element, not tolerance (FM8)"
+    },
+    {
+      "check": "sequence_contains_both_outcomes",
+      "pass": true,
+      "n_keyframes": 19,
+      "n_non_keyframes": 33,
+      "detail": "if either is 0 the identity check above is vacuous"
+    },
+    {
+      "check": "threshold_margin_exceeds_fp32_ulp",
+      "pass": true,
+      "min_abs_margin": 0.02078152,
+      "fp32_ulp": 2.384185791015625e-07,
+      "detail": "C3 compares in fp32 where the original compared float64; identity is safe only while flow_mag stays off the threshold by more than an ulp. This measures the margin on THIS trajectory -- a real sequence could sit closer, so the margin, not the identity, is the durable claim"
+    },
+    {
+      "check": "wrong_variant_diverges_as_expected",
+      "pass": true,
+      "n_differences": 25,
+      "detail": "10% depth scaling perturbs the reprojected flow; if this MATCHES, the identity check cannot detect a wrong answer and check 3 is vacuous"
+    },
+    {
+      "check": "decision_is_device_tensor_not_bool",
+      "pass": true,
+      "type": "Tensor",
+      "device": "cuda:0",
+      "dtype": "torch.bool"
+    },
+    {
+      "check": "depth_none_forces_keyframe",
+      "pass": true,
+      "detail": "matches gct_stream_window.py:572's flow_mag = flow_threshold + 1.0"
+    },
+    {
+      "check": "gap_rule_fires_at_boundary_only",
+      "pass": true,
+      "at_gap": true,
+      "below_gap": false,
+      "detail": "zero motion isolates the gap term from the flow term"
+    }
+  ]
+}

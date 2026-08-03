@@ -1,0 +1,146 @@
+{
+  "suite": "neuron C4 wiring: real inference loops, pre-C4 baseline vs post-C4",
+  "primary_gate": "per-frame keyframe decision sequence at both loop sites",
+  "injected_bug": null,
+  "expected_verdict": "PASS",
+  "n_checks": 11,
+  "n_fail": 0,
+  "verdict": "PASS",
+  "baseline_config": {
+    "mode": "baseline",
+    "checkpoint": "/home/kwehden/lingbot-tier1/models/lingbot-map-long.pt",
+    "output_dir": "/tmp/c4_r2",
+    "baseline_dir": "/tmp/c4_r2",
+    "image_size": 518,
+    "n_frames": 12,
+    "scale_frames": 4,
+    "sliding_window": 8,
+    "window_size": 12,
+    "overlap": 4,
+    "flow_threshold": 1000000000.0,
+    "max_gap": 6,
+    "inject_bug": null
+  },
+  "compare_config": {
+    "mode": "compare",
+    "checkpoint": "/home/kwehden/lingbot-tier1/models/lingbot-map-long.pt",
+    "output_dir": "/tmp/c4_r2",
+    "baseline_dir": "/tmp/c4_r2",
+    "image_size": 518,
+    "n_frames": 12,
+    "scale_frames": 4,
+    "sliding_window": 8,
+    "window_size": 12,
+    "overlap": 4,
+    "flow_threshold": 1000000000.0,
+    "max_gap": 6,
+    "inject_bug": null
+  },
+  "results": [
+    {
+      "check": "streaming_decision_sequence_identical",
+      "pass": true,
+      "n_frames": 8,
+      "n_keyframes": 2,
+      "n_non_keyframes": 6,
+      "baseline_len": 8,
+      "compare_len": 8,
+      "first_divergence": null,
+      "detail": "per-frame keyframe decision recovered from the commit/rollback hooks; exact integers, no tolerance"
+    },
+    {
+      "check": "streaming_sequence_contains_both_outcomes",
+      "pass": true,
+      "n_keyframes": 2,
+      "n_non_keyframes": 6,
+      "detail": "if either is 0 the identity check above is vacuous"
+    },
+    {
+      "check": "windowed_decision_sequence_identical",
+      "pass": true,
+      "n_frames": 8,
+      "n_keyframes": 2,
+      "n_non_keyframes": 6,
+      "baseline_len": 8,
+      "compare_len": 8,
+      "first_divergence": null,
+      "detail": "per-frame keyframe decision recovered from the commit/rollback hooks; exact integers, no tolerance"
+    },
+    {
+      "check": "windowed_sequence_contains_both_outcomes",
+      "pass": true,
+      "n_keyframes": 2,
+      "n_non_keyframes": 6,
+      "detail": "if either is 0 the identity check above is vacuous"
+    },
+    {
+      "check": "windowed_frame_type_identical",
+      "pass": true,
+      "n_differences": 0,
+      "n_frames": 12,
+      "detail": "independent second observable: the loop's own 0/1/2 record"
+    },
+    {
+      "check": "frame_type_agrees_with_hook_trace",
+      "pass": true,
+      "n_from_frame_type": 8,
+      "n_from_hooks": 8,
+      "detail": "cross-validates the instrumentation itself: if the recorder missed or double-counted a call, these two counts diverge"
+    },
+    {
+      "check": "model_is_run_to_run_deterministic",
+      "pass": true,
+      "baseline": true,
+      "compare": true,
+      "detail": "licenses the bit-exact prediction comparison below; if False those checks are reported as SKIP because any diff would be framework noise, not C4"
+    },
+    {
+      "check": "streaming_pose_enc_bit_exact",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "shape": [
+        1,
+        12,
+        9
+      ],
+      "detail": "bit-exact"
+    },
+    {
+      "check": "streaming_depth_bit_exact",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "shape": [
+        1,
+        12,
+        518,
+        518,
+        1
+      ],
+      "detail": "bit-exact"
+    },
+    {
+      "check": "windowed_pose_enc_bit_exact",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "shape": [
+        1,
+        12,
+        9
+      ],
+      "detail": "bit-exact"
+    },
+    {
+      "check": "windowed_depth_bit_exact",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "shape": [
+        1,
+        12,
+        518,
+        518,
+        1
+      ],
+      "detail": "bit-exact"
+    }
+  ]
+}

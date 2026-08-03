@@ -18,6 +18,7 @@ from lingbot_map.utils.rotation import quat_to_mat, mat_to_quat
 
 from lingbot_map.heads.camera_head import CameraCausalHead
 from lingbot_map.models.gct_base import GCTBase
+from lingbot_map.models.keyframe import keyframe_decision
 from lingbot_map.aggregator.stream import AggregatorStream
 from lingbot_map.utils.pose_enc import pose_encoding_to_extri_intri
 from lingbot_map.utils.geometry import closed_form_inverse_se3
@@ -38,6 +39,13 @@ def _compute_flow_magnitude(
     Projects current frame pixels into the last keyframe camera using the
     current depth map and both frames' poses, then returns the average
     pixel displacement (L2 norm of flow) over valid pixels.
+
+    No longer called by this module's inference loops: both switched to
+    ``lingbot_map.models.keyframe.keyframe_decision`` (C3), which is branchless and returns a
+    device tensor instead of syncing here. Kept because it is the REFERENCE that C3 is
+    verified against — ``verify/neuron/check_keyframe_decision.py`` compares the two
+    directly and requires bit-exact agreement, so deleting this would delete the thing that
+    makes the equivalence claim checkable. ``gct_stream_window_v2.py`` still has its own copy.
 
     Args:
         cur_pose_enc: Current frame pose encoding [B, 1, 9].
@@ -561,23 +569,24 @@ class GCTStream(GCTBase):
 
                 self._set_defer_eviction(False)
 
-                # Compute flow to decide keyframe
+                # Compute flow to decide keyframe (C3; see lingbot_map/models/keyframe.py).
+                # Branchless and device-resident so the reprojection stays in one compiled
+                # graph on Neuron; the single `.item()` below is the one accepted host sync
+                # per frame, because commit-vs-rollback is Python-side cache bookkeeping.
+                # Verified element-for-element identical to the previous inline branch —
+                # verify/neuron/check_keyframe_decision.py.
                 cur_depth = frame_output.get("depth", None)
-                if cur_depth is not None:
-                    H_pred, W_pred = cur_depth.shape[2], cur_depth.shape[3]
-                    flow_mag = _compute_flow_magnitude(
-                        frame_output["pose_enc"], last_kf_pose_enc,
-                        cur_depth, (H_pred, W_pred),
-                    )
-                else:
-                    flow_mag = flow_threshold + 1.0
-
-                frames_since_kf = i - last_kf_idx
-                is_keyframe = (
-                    (i == scale_frames)  # first streaming frame
-                    or (flow_mag > flow_threshold)
-                    or (frames_since_kf >= max_non_keyframe_gap)
+                hw = (cur_depth.shape[2], cur_depth.shape[3]) if cur_depth is not None else None
+                frames_since_kf = torch.tensor(
+                    i - last_kf_idx, dtype=torch.int32, device=frame_output["pose_enc"].device
                 )
+                is_keyframe = bool(keyframe_decision(
+                    frame_output["pose_enc"], last_kf_pose_enc, cur_depth, hw,
+                    frames_since_kf,
+                    flow_threshold=flow_threshold,
+                    max_non_keyframe_gap=max_non_keyframe_gap,
+                    is_first_streaming_frame=(i == scale_frames),
+                ).item())
 
                 if is_keyframe:
                     self._execute_deferred_eviction()
@@ -1124,24 +1133,22 @@ class GCTStream(GCTBase):
                     )
                     self._set_defer_eviction(False)
 
-                    # Compute flow
+                    # Compute flow (C3 — the same call as inference_streaming above; this
+                    # site and that one were duplicated logic, design.md F6).
                     cur_depth = frame_out.get("depth", None)
-                    if cur_depth is not None:
-                        H_pred, W_pred = cur_depth.shape[2], cur_depth.shape[3]
-                        flow_mag = _compute_flow_magnitude(
-                            frame_out["pose_enc"], last_kf_pose_enc,
-                            cur_depth, (H_pred, W_pred),
-                        )
-                    else:
-                        flow_mag = flow_threshold + 1.0
-
+                    hw = (cur_depth.shape[2], cur_depth.shape[3]) if cur_depth is not None else None
                     local_idx = window_scale + (cursor - window_start - window_scale)
-                    frames_since_kf = local_idx - last_kf_local_idx
-                    is_keyframe = (
-                        (kf_count == 0)  # first streaming frame
-                        or (flow_mag > flow_threshold)
-                        or (frames_since_kf >= max_non_keyframe_gap)
+                    frames_since_kf = torch.tensor(
+                        local_idx - last_kf_local_idx, dtype=torch.int32,
+                        device=frame_out["pose_enc"].device,
                     )
+                    is_keyframe = bool(keyframe_decision(
+                        frame_out["pose_enc"], last_kf_pose_enc, cur_depth, hw,
+                        frames_since_kf,
+                        flow_threshold=flow_threshold,
+                        max_non_keyframe_gap=max_non_keyframe_gap,
+                        is_first_streaming_frame=(kf_count == 0),
+                    ).item())
 
                     if is_keyframe:
                         self._execute_deferred_eviction()
