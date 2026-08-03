@@ -1,0 +1,313 @@
+{
+  "suite": "neuron C5 camera cache vs CameraCausalHead (design.md V5(a)/V6)",
+  "device": "cuda",
+  "reference": "REAL CameraCausalHead -> CameraBlock -> CausalAttention, nothing stubbed; attended k/v observed by shimming F.scaled_dot_product_attention at attention.py:284",
+  "injected_bug": null,
+  "expected_verdict": "PASS",
+  "n_checks": 34,
+  "n_fail": 0,
+  "verdict": "PASS",
+  "prod_memory_report": {
+    "num_slots": 16,
+    "slot_shape": [
+      1,
+      16,
+      1152,
+      1,
+      128
+    ],
+    "dtype": "torch.float32",
+    "bytes_per_slot_per_side": 9437184,
+    "bytes_k_only": 150994944,
+    "bytes_k_and_v": 301989888,
+    "MB_k_only": 150.99,
+    "MB_k_and_v": 301.99,
+    "MB_k_only_live": 147.32,
+    "MB_k_and_v_live": 294.65,
+    "pad_overhead_pct": 2.49,
+    "plan": {
+      "n_keys": 1125,
+      "n_tiles": 1,
+      "tile": 1152,
+      "padded": 1152
+    },
+    "cat_calls_per_frame_avoided": 32
+  },
+  "results": [
+    {
+      "check": "device",
+      "pass": true,
+      "device": "cuda",
+      "gpu": "NVIDIA A10G",
+      "injected_bug": "none",
+      "expected_verdict": "PASS"
+    },
+    {
+      "check": "no_rollback_method_on_C5",
+      "pass": true,
+      "detail": "Gap A preserved, not fixed (design.md :715-718). THIS GATE is what holds that line: the hasattr guards at gct_stream_window.py:397 and v2:466 interrogate the HEAD, not the cache, so they are permanently false because CameraCausalHead lacks the method and stay false whatever the cache exposes (verified: a subclass with a rollback assigned as head.kv_cache does not make the guard fire). A rollback on C5 would only be REACHED if the wiring follow-on also forwarded one from CameraCausalHead"
+    },
+    {
+      "check": "camera_attended_kv_matches_gpu",
+      "pass": true,
+      "frames": 40,
+      "slots": 4,
+      "keyframes": 35,
+      "non_keyframes": 5,
+      "detail": "element-for-element identical, K and V, every slot, every frame, both _skip_append branches (torch.equal)"
+    },
+    {
+      "check": "camera_cache_contents_match_gpu",
+      "pass": true,
+      "detail": "C5's committed buffer prefix == the reference dict's k_{j}/v_{j}, independent of the attended oracle"
+    },
+    {
+      "check": "skip_append_semantics_match",
+      "pass": true,
+      "depth": "stored depth +1 on keyframe, +0 on non-keyframe",
+      "valid": "valid_len == n_stored + n_frames on both branches",
+      "detail": "both halves gated: asserting only the depth misses the bug that drops the current frame from its own attention"
+    },
+    {
+      "check": "frame_idx_diverges_from_depth_by_non_keyframe_count",
+      "pass": true,
+      "frame_idx": 42,
+      "cache_depth": 37,
+      "non_keyframes": 5,
+      "drift": 5,
+      "detail": "camera_head.py:374-375 increments frame_idx UNCONDITIONALLY, unlike the aggregator's guarded total_frames_processed (stream.py:535). A reimplementation that 'fixes' this drift passes every other gate"
+    },
+    {
+      "check": "sequence_contains_both_outcomes",
+      "pass": true,
+      "n_keyframes": 35,
+      "n_non_keyframes": 5,
+      "detail": "if either is 0 the identity checks above are vacuous"
+    },
+    {
+      "check": "buffer_filled_past_the_scale_prefill",
+      "pass": true,
+      "max_depth": 37,
+      "scale_prefill": 3,
+      "detail": "if this is <= the prefill, only the first-write path was exercised"
+    },
+    {
+      "check": "both_sides_nonempty",
+      "pass": true,
+      "compared": 160,
+      "nonempty": 160,
+      "detail": "if any compared pair was empty, torch.equal on it is trivially True"
+    },
+    {
+      "check": "keys_not_identical_by_construction",
+      "pass": true,
+      "nonzero": true,
+      "varies_across_frames": true,
+      "detail": "random per-frame input: neither all-zeros nor constant, so equality is informative"
+    },
+    {
+      "check": "multiple_iterations_and_blocks_exercised",
+      "pass": true,
+      "slots": 4,
+      "detail": "all iterations x blocks written; a per-slot indexing bug is invisible with one slot"
+    },
+    {
+      "check": "sdpa_call_count_matches_slot_count",
+      "pass": true,
+      "counts": [
+        4
+      ],
+      "expected": 4,
+      "detail": "cross-validates the recorder's call-order -> (iteration, block) mapping"
+    },
+    {
+      "check": "fixed_shapes_across_all_frames",
+      "pass": true,
+      "n_distinct_buffer_shapes": 1,
+      "shape": "(1, 4, 128, 1, 8)",
+      "detail": "one shape for every frame -> one NEFF"
+    },
+    {
+      "check": "cursor_is_device_tensor_not_int",
+      "pass": true,
+      "kinds": [
+        [
+          true,
+          "torch.int64"
+        ]
+      ],
+      "detail": "design.md :711-712 mandates a device-tensor cursor for C5 specifically; C1's host int is only tolerable at its 74-slot range"
+    },
+    {
+      "check": "valid_len_is_device_tensor_not_int",
+      "pass": true,
+      "kinds": [
+        [
+          true,
+          "torch.int32",
+          0
+        ]
+      ],
+      "detail": "0-d int32 tensor; as a Python int it would bake the frame length into the graph and recompile every frame (neuron_kv_cache.py:485-488)"
+    },
+    {
+      "check": "exactly_one_item_and_it_is_inside_visible_kv_reference",
+      "pass": true,
+      "item_count_in_module": 1,
+      "cat_count_in_module": 0,
+      "item_lines": [
+        909
+      ],
+      "visible_kv_reference_span": "(894, 916)",
+      "item_lines_outside_that_span": [],
+      "detail": "COUNT + ast SPAN, not position relative to a marker: the single .item() must be the one in visible_kv_reference (VERIFICATION ONLY, matching neuron_kv_cache.py:535-545) and there must be no torch.cat anywhere. A positional split let a host sync added in any later-declared method pass"
+    },
+    {
+      "check": "no_host_int_state_read_in_the_visible_path",
+      "pass": true,
+      "offending_reads": [],
+      "methods_scanned": "visible_kv, visible_mask, visible_group",
+      "host_int_attrs": "_n_stored, _n_pending",
+      "detail": "valid_len = (_cursor + _pending) with BOTH device tensors. Reading the host mirror here would fold the keyframe/non-keyframe difference into the graph as a literal -- the exact coupling design.md :711-712's device cursor exists to remove"
+    },
+    {
+      "check": "static_discipline_gates_have_discriminating_power",
+      "pass": true,
+      "item_gate_rejects_late_method_mutant": true,
+      "host_int_gate_rejects_n_pending_mutant": true,
+      "evidence": "item_mutant: count=2 outside_span=[919]; host_int_mutant: reads=['visible_kv:_n_pending@L588']",
+      "detail": "--inject_bug patches objects and cannot reach a source-reading gate, so the two above are re-evaluated against synthetic mutants of C5's own source and must report FALSE on both. Without this, a source gate reporting PASS proves only that it ran"
+    },
+    {
+      "check": "f6_guard_holds_shape3_is_1",
+      "pass": true,
+      "shape3_values_seen": [
+        1
+      ],
+      "detail": "all 16-equivalent streams, k AND v, every frame; iterating BOTH axes (design.md writes kv_cache[f'k_{i}'], eliding the list axis)"
+    },
+    {
+      "check": "f6_guard_was_actually_reached",
+      "pass": true,
+      "eviction_calls": 140,
+      "body_entries": 0,
+      "special_keys": [],
+      "shape2_decreases": 0,
+      "detail": "positive proof the guard at attention.py:307 was EVALUATED and its body never ran. design.md omits this; without it the shape3 check above is vacuous on an unwritten cache"
+    },
+    {
+      "check": "f6_port_side_frame_axis_is_exactly_1_wide",
+      "pass": true,
+      "slot_shape": "(1, 4, 128, 1, 8)",
+      "frame_seqlen": 1,
+      "k_shape3": [
+        1
+      ],
+      "v_shape3": [
+        1
+      ],
+      "detail": "on the LIVE C5 instance and its allocated buffers. design.md's C5 row is [B,H,max_total_frames,1,head_dim]; this asserts that 1, which the whole no-eviction design rests on, rather than restating it"
+    },
+    {
+      "check": "f6_ctor_refuses_frame_seqlen_not_1",
+      "pass": true,
+      "msg": "frame_seqlen=2 != 1. Camera streams have shape[3] == 1, which is what makes _apply_kv_cache_eviction_causal's ",
+      "detail": "never exercised before this gate existed: grep 'frame_seqlen=' over the harness returned 0 hits, so no non-default frame_seqlen was ever built"
+    },
+    {
+      "check": "f6_write_refuses_shape3_gt_1_independently_of_config",
+      "pass": true,
+      "raised_with_config_1": true,
+      "raised_with_config_relaxed_to_2": true,
+      "non_guard_errors": "(none)",
+      "msg": "shape[3]=2 (frame_seqlen=1): both must be exactly 1. Camera streams keep shape[3] == 1; that guard (",
+      "detail": "the append-side check must test shape[3] against the LITERAL 1, not against self.frame_seqlen. A config echo self-adjusts to whatever the constructor permitted and provides no independent protection -- measured: relaxing only the ctor made a [1,4,3,2,8] write ACCEPTED, storing 3 frames with valid_len 6 while the GPU entered the eviction body on 32/36 calls"
+    },
+    {
+      "check": "shape3_invariant_is_self_perpetuating",
+      "pass": true,
+      "recompute_line_present": true,
+      "detail": "attention.py:236 re-derives num_frame_per_block from the cache's own shape[3], so 1 begets 1 forever. The fragile premise is nfpb == S on the FIRST prefill call, NOT frame_seqlen as design.md F6 states"
+    },
+    {
+      "check": "gpu_path_untouched_cat_still_present",
+      "pass": true,
+      "cat_sites": 4,
+      "detail": "attention.py:239-240 must stay byte-identical; the reference is only a valid oracle while it does"
+    },
+    {
+      "check": "hasattr_rollback_is_False_before_and_after",
+      "pass": true,
+      "before": false,
+      "after": false,
+      "detail": "on the real CameraCausalHead INSTANCE, not the class (design.md V6)"
+    },
+    {
+      "check": "capacity_raises_naming_max_total_frames",
+      "pass": true,
+      "at_frame": 3,
+      "msg": "slot (iter=0, block=0): camera cache exhausted at n_stored=3 + 1 frames > capacity. Increase max_total_frames ",
+      "detail": "ASYMMETRIC with the GPU by design: the camera head has NO assert at all (attention.py:239-240 cats until OOM), so design.md FM4's 'GPU raises no earlier' clause is inapplicable here. Deltas Owed #12. KEYFRAMES only -- see the non-keyframe gate below"
+    },
+    {
+      "check": "non_keyframe_at_capacity_does_not_raise",
+      "pass": true,
+      "n_stored_before": 6,
+      "valid_len_after": 7,
+      "n_stored_after": 6,
+      "error": "(none)",
+      "detail": "capacity is charged for COMMITS only, and one row above max_total_frames is reserved (spec_headroom) so the uncommitted frame has a physical row and valid_len still names where the write landed. Guarding before the skip_append branch aborted inference in a state the GPU cannot fail in"
+    },
+    {
+      "check": "keyframe_at_capacity_still_raises",
+      "pass": true,
+      "msg": "slot (iter=0, block=0): camera cache exhausted at n_stored=6 + 1 frames > capacity. Increase max_total_frames ",
+      "n_stored": 6,
+      "detail": "the paired half: moving the guard into the keyframe branch must not weaken the bound C5 exists to impose"
+    },
+    {
+      "check": "compute_attention_feeds_the_adapter_a_tile_padded_buffer",
+      "pass": true,
+      "k_keys": 1152,
+      "plan": "TilePlan(n_keys=1125, n_tiles=1, tile=1152, padded=1152)",
+      "valid": "torch.int32 dim=0 value=1",
+      "out_shape": "(1, 4, 5, 8)",
+      "detail": "plan.padded keys (NOT max_total_frames), a TILE_QUANTUM-aligned tile, and a 0-d int32 device valid_len. Allocating the raw 1124 made this method unreachable at every adapter tile choice -- and the suite could not see it, because it never called compute_attention at all"
+    },
+    {
+      "check": "real_adapter_shape_contract_is_satisfiable_at_prod_capacity",
+      "pass": true,
+      "adapter_padded": 1152,
+      "plan_padded": 1152,
+      "quantized_tiles_dividing_1124": [],
+      "detail": "the empty divisor list is the proof that a raw-max_total_frames allocation is not merely wasteful but IMPOSSIBLE to attend: no legal tile makes padded_seqlen_k == 1124"
+    },
+    {
+      "check": "reset_clears_cursors_without_reallocating",
+      "pass": true,
+      "same_buffer": true,
+      "detail": "buffers intentionally NOT reallocated; stale rows sit outside valid_len"
+    },
+    {
+      "check": "prod_geometry_matches_design_C5",
+      "pass": true,
+      "num_slots": 16,
+      "slot_shape": "(1, 16, 1152, 1, 128)",
+      "capacity": 1124,
+      "plan": "TilePlan(n_keys=1125, n_tiles=1, tile=1152, padded=1152)",
+      "dtype": "torch.float32",
+      "detail": "design.md :704-709 states the LIVE geometry, 16 slots of [1,16,1124,1,128] fp32 (NOT bf16); the frame axis is allocated 1152 = plan_tiles(1124+1).padded because C2's seam requires a TILE_QUANTUM-aligned key extent. Capacity is still 1124 committed frames. Deltas Owed #12"
+    },
+    {
+      "check": "prod_bytes_match_design_data_model_row",
+      "pass": true,
+      "MB_k_only_live": 147.32,
+      "MB_k_and_v_live": 294.65,
+      "MB_k_and_v_allocated": 301.99,
+      "pad_overhead_pct": 2.49,
+      "GB_k_and_v": 0.302,
+      "cat_calls_avoided_per_frame": 32,
+      "detail": "computed from the live buffers, not hardcoded: design.md's Data Model row claims 2 x 147 MB ~= 0.30 GB for K+V at the LIVE extent, which *_live matches; the tile padding adds 2.49%, reported rather than hidden. C1's harness caught a stale table row exactly this way"
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "suite": "C5 attention-output parity (V5(a) numerical half)",
+  "device": "cuda",
+  "injected_bug": "in_prefix_permuted",
+  "honour_prior_used_len": true,
+  "n_checks": 4,
+  "n_fail": 0,
+  "verdict": "PASS",
+  "results": [
+    {
+      "check": "device",
+      "pass": true,
+      "device": "cuda",
+      "gpu": "NVIDIA A10G"
+    },
+    {
+      "check": "attention_output_matches_gpu_sdpa",
+      "pass": true,
+      "worst_rel_err": "1.456e-06",
+      "tol": 0.0001,
+      "rows": [
+        {
+          "frames": 8,
+          "seqlen_q": 1,
+          "rel_err": 4.352687028585933e-07,
+          "bit_equal": false
+        },
+        {
+          "frames": 100,
+          "seqlen_q": 1,
+          "rel_err": 9.722488130137208e-07,
+          "bit_equal": false
+        },
+        {
+          "frames": 1124,
+          "seqlen_q": 1,
+          "rel_err": 1.455916503800836e-06,
+          "bit_equal": false
+        },
+        {
+          "frames": 1124,
+          "seqlen_q": 5,
+          "rel_err": 1.034577508107759e-06,
+          "bit_equal": false
+        }
+      ],
+      "expect": "within tol",
+      "detail": "compute_attention through the real NeuronAttentionAdapter vs F.scaled_dot_product_attention over the identical visible keys. This is the gate the 34-check suite lacks entirely (rel_err defined, never called)"
+    },
+    {
+      "check": "prefix_alignment_is_gated",
+      "pass": true,
+      "aligned": false,
+      "valid_len": 12,
+      "detail": "visible_group's live prefix must equal the reference reshape. valid_len bounds a PHYSICAL prefix, so a transform moving live keys out of [0,valid_len) attends padding and drops real keys -- NOT permutation-invariant, contrary to check_c5_camera_cache.py:332-335's stated rationale"
+    },
+    {
+      "check": "mismatched_adapter_head_dim_is_rejected",
+      "pass": true,
+      "msg": "attention_adapter geometry disagrees with this cache: adapter.head_dim=64 but cache head_d",
+      "detail": "The adapter folds scale=head_dim**-0.5 into q, so the trunk's head_dim=64 adapter on the head_dim=128 camera cache is silently wrong (rel_err ~0.3, finite, right-shaped). Must raise at construction"
+    }
+  ]
+}
