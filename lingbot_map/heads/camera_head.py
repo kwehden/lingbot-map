@@ -248,10 +248,53 @@ class CameraCausalHead(nn.Module):
         self.pos_cache = None
         self.frame_idx = 0
 
+        #: Optional :class:`NeuronCameraCache` (design.md C5), installed by
+        #: :meth:`install_neuron_cache`. Held in its OWN attribute, deliberately not in
+        #: ``self.kv_cache``: ``clean_kv_cache`` does ``del self.kv_cache``, after which
+        #: :meth:`forward`'s ``if self.kv_cache is None`` would silently rebuild the
+        #: list-of-dicts and resume the ``torch.cat`` path with no error and no log line,
+        #: orphaning the C5 instance. The dicts are still created and still carry
+        #: ``_skip_append``, so every existing reader and writer keeps working; only the
+        #: per-block store/read is rerouted (``attention.py:230-256``).
+        self.neuron_cache = None
+
+    def install_neuron_cache(self, cache) -> None:
+        """Route the causal camera-head KV store through a ``NeuronCameraCache`` (C5).
+
+        Replaces the per-frame ``torch.cat`` at ``attention.py:239-240``/``:252-253`` with an
+        indexed write at a device cursor, so the key extent the graph sees is a compile-time
+        constant. Pass ``None`` to restore the stock path.
+
+        The cache's geometry must match this head's, and ``NeuronCameraCache`` validates that
+        against its own adapter at construction; here we check the two dimensions this head
+        owns, so a mismatch is a construction-time error rather than a wrong-shaped write
+        several frames later.
+        """
+        if cache is not None:
+            if cache.trunk_depth != self.trunk_depth:
+                raise ValueError(
+                    f"NeuronCameraCache.trunk_depth={cache.trunk_depth} != "
+                    f"head.trunk_depth={self.trunk_depth}"
+                )
+            if cache.num_heads != self.num_heads:
+                raise ValueError(
+                    f"NeuronCameraCache.num_heads={cache.num_heads} != "
+                    f"head.num_heads={self.num_heads}"
+                )
+        self.neuron_cache = cache
+
     def clean_kv_cache(self):
         del self.kv_cache
         self.kv_cache = None
         self.frame_idx = 0
+        # NOT a start-of-sequence-only call: the windowed drivers invoke it once per WINDOW,
+        # mid-run, inside `while cursor < S` (gct_stream_window.py:1094/:1213,
+        # gct_stream_window_v2.py:1159/:1280 -- "Fresh KV cache"). The dict above restarts at
+        # depth 0, so C5's cursors must restart with it or the next window attends the
+        # previous window's keys (measured: GPU 3 keys vs C5 8, attention rel_err 0.90).
+        # reset() keeps the buffers, so this is cheap and reallocates nothing.
+        if self.neuron_cache is not None:
+            self.neuron_cache.reset()
 
     def forward(self, aggregated_tokens_list: list, mask=None, num_iterations: int = None, causal_inference=False, num_frame_per_block=1, num_frame_for_scale=-1, sliding_window_size=None, **kwargs) -> list:
         """
@@ -355,7 +398,10 @@ class CameraCausalHead(nn.Module):
             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
 
             for idx in range(self.trunk_depth):
-                pose_tokens_modulated = self.trunk[idx](pose_tokens_modulated, pos=pos3d, video_mask=mask, num_frames=S, frame_seqlen=1, kv_cache=self.kv_cache[i] if self.kv_cache is not None else None, global_idx=idx, num_frame_per_block=num_frame_per_block, num_frame_for_scale=num_frame_for_scale, sliding_window_size=sliding_window_size, enable_3d_rope=self.enable_3d_rope, is_scale_frames=is_scale_frames)
+                # neuron_cache/neuron_slot are inert unless install_neuron_cache was called
+                # (C5). The slot is (iteration, block) because the 16 streams are independent
+                # caches, not one cache with a batch axis.
+                pose_tokens_modulated = self.trunk[idx](pose_tokens_modulated, pos=pos3d, video_mask=mask, num_frames=S, frame_seqlen=1, kv_cache=self.kv_cache[i] if self.kv_cache is not None else None, global_idx=idx, num_frame_per_block=num_frame_per_block, num_frame_for_scale=num_frame_for_scale, sliding_window_size=sliding_window_size, enable_3d_rope=self.enable_3d_rope, is_scale_frames=is_scale_frames, neuron_cache=self.neuron_cache, neuron_slot=(i, idx))
             # Compute the delta update for the pose encoding.
             pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
 

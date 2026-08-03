@@ -136,7 +136,7 @@ class CausalAttention(nn.Module):
         self.kv_cache_include_scale_frames = kv_cache_include_scale_frames
         self.kv_cache_camera_only = kv_cache_camera_only
 
-    def forward(self, x: Tensor, block_mask=None, pos=None, pos_kv=None, frame_seqlen=None, video_mask=None, kv_cache=None, current_start=0, current_end=0, global_idx=0, num_frame_per_block=1, num_frame_for_scale=-1, enable_3d_rope=False, sliding_window_size=-1, attend_to_scale_frames=False, num_random_frames=0, attend_to_special_tokens=False, num_register_tokens=4, is_scale_frames=False) -> Tensor:
+    def forward(self, x: Tensor, block_mask=None, pos=None, pos_kv=None, frame_seqlen=None, video_mask=None, kv_cache=None, current_start=0, current_end=0, global_idx=0, num_frame_per_block=1, num_frame_for_scale=-1, enable_3d_rope=False, sliding_window_size=-1, attend_to_scale_frames=False, num_random_frames=0, attend_to_special_tokens=False, num_register_tokens=4, is_scale_frames=False, neuron_cache=None, neuron_slot=None) -> Tensor:
         B, N, C = x.shape
 
         # Calculate special token indices
@@ -223,11 +223,62 @@ class CausalAttention(nn.Module):
 
             # Check if we should skip appending to cache (non-keyframe in keyframe mode)
             skip_append = kv_cache.get("_skip_append", False)
+            neuron_attended = False       # set by the C5 seam's adapter branch below
 
             k_reshaped = k.view(B, self.num_heads, num_frame_per_block, N // num_frame_per_block, self.head_dim)
             v_reshaped = v.view(B, self.num_heads, num_frame_per_block, N // num_frame_per_block, self.head_dim)
 
-            if not skip_append:
+            if neuron_cache is not None:
+                # ── C5 seam (design.md :712-713) ───────────────────────────────────────
+                # The per-frame torch.cat below becomes an indexed write at a device cursor,
+                # so the key extent the graph sees is a compile-time constant. Everything
+                # after this block is unchanged: k/v come back in the same
+                # [B, H, frames, frame_seqlen, D] layout the cat produced, and the
+                # reshape/special-prepend/SDPA path consumes them identically.
+                #
+                # skip_append is passed per-call rather than read from the cache's own host
+                # bool, because the GPU's flag lives in the dict and the driver's setter is a
+                # no-op before the dicts exist (gct_stream_window.py:365) -- taking it from
+                # `kv_cache` here keeps the two in lockstep by construction instead of
+                # relying on the driver to set them in a particular order.
+                #
+                # Eviction is deliberately not called: camera streams have shape[3] == 1, so
+                # _apply_kv_cache_eviction_causal's body (:307) is unreachable, and C5
+                # implements no eviction (design.md F6). C5's constructor refuses
+                # frame_seqlen != 1, so this stays true or fails loudly.
+                #
+                # TWO REGIMES, and the difference is the padded tail:
+                #
+                #   (a) adapter absent (desk/GPU parity). `visible_kv` hands back the WHOLE
+                #       padded buffer, and the mask built at :279 below is all-ones, so
+                #       feeding it straight through would attend the padding rows. Slice to
+                #       the live prefix. That makes the key extent frame-varying, which is
+                #       precisely what C5 exists to avoid -- so this branch is the parity
+                #       oracle, NOT the Neuron path. It isolates the store: predictions must
+                #       come out bit-exact against the stock torch.cat, and the wiring gate
+                #       asserts exactly that.
+                #
+                #   (b) adapter present (Neuron). Attend at the fixed padded extent through
+                #       C2, where `valid_len` masks the tail instead of a slice. Bypasses the
+                #       SDPA block below entirely. Gated numerically by
+                #       verify/neuron/check_c5_attention_parity.py (7 checks vs SDPA,
+                #       rel_err ~1.2e-6), not by this file.
+                iter_idx, block_idx = neuron_slot
+                neuron_cache.set_skip_append(bool(skip_append), iter_idx=iter_idx)
+                k, v, valid = neuron_cache.append(iter_idx, block_idx, k_reshaped, v_reshaped)
+                if neuron_cache.attention is not None:
+                    x = neuron_cache.compute_attention(iter_idx, block_idx, q)
+                    neuron_attended = True
+                else:
+                    # `int(valid)` is a host sync per block per frame, and the slice makes the
+                    # key extent frame-varying. Both are exactly what the Neuron path must not
+                    # do -- which is why this branch is only ever the parity oracle. Do not
+                    # benchmark it and do not compile it.
+                    n_live = int(valid) // neuron_cache.frame_seqlen
+                    k = k[:, :, :n_live]
+                    v = v[:, :, :n_live]
+                    neuron_attended = False
+            elif not skip_append:
                 # KEYFRAME: store in cache (original behavior)
                 if kv_cache[f"k_{global_idx}"] is None:
                     kv_cache[f"k_{global_idx}"] = k_reshaped
@@ -254,13 +305,14 @@ class CausalAttention(nn.Module):
                 else:
                     k = k_reshaped
                     v = v_reshaped
-            a, b, c, d, e = k.shape
+            if not neuron_attended:
+                a, b, c, d, e = k.shape
 
-            k = k.reshape(a, b, c*d, e)
-            v = v.reshape(a, b, c*d, e)
+                k = k.reshape(a, b, c*d, e)
+                v = v.reshape(a, b, c*d, e)
 
             # Prepend special tokens (camera + scale) from evicted frames if they exist
-            if f"k_{global_idx}_special" in kv_cache and kv_cache[f"k_{global_idx}_special"] is not None:
+            if not neuron_attended and f"k_{global_idx}_special" in kv_cache and kv_cache[f"k_{global_idx}_special"] is not None:
                 special_k = kv_cache[f"k_{global_idx}_special"]  # [B, H, num_evicted_frames, 2, D]
                 special_v = kv_cache[f"v_{global_idx}_special"]
                 sa, sb, sc, sd, se = special_k.shape
@@ -273,7 +325,10 @@ class CausalAttention(nn.Module):
 
             # Note: k from cache is already RoPE-applied, no need to apply again
 
-            if self.fused_attn:
+            # `neuron_attended` means C5's adapter already produced x at the fixed padded
+            # extent; k/v here are the padded buffers, so this all-ones mask would attend the
+            # tail. Skip rather than re-attend.
+            if self.fused_attn and not neuron_attended:
                 # Use mask-based SDPA to ensure same kernel as batch mode
                 # The causal constraint is enforced by KV cache contents, not by mask
                 mask = torch.ones(B, 1, q.shape[2], k.shape[2], dtype=torch.bool, device=q.device)

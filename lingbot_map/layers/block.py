@@ -414,11 +414,13 @@ class CameraBlock(nn.Module):
 
         return block_mask
 
-    def forward(self, x: Tensor, pos=None, video_mask=None, num_frames=0, frame_seqlen=0, kv_cache=None, current_start=0, current_end=0, global_idx=0, num_frame_per_block=8, num_frame_for_scale=-1, sliding_window_size=None, full_attention=False, enable_3d_rope=False, is_scale_frames=False) -> Tensor:
+    def forward(self, x: Tensor, pos=None, video_mask=None, num_frames=0, frame_seqlen=0, kv_cache=None, current_start=0, current_end=0, global_idx=0, num_frame_per_block=8, num_frame_for_scale=-1, sliding_window_size=None, full_attention=False, enable_3d_rope=False, is_scale_frames=False, neuron_cache=None, neuron_slot=None) -> Tensor:
         # Use passed sliding_window_size if provided, otherwise use self.sliding_window_size
         effective_sliding_window_size = sliding_window_size if sliding_window_size is not None else self.sliding_window_size
 
         # Fast path for full attention (camera head) - skip mask computation
+        # NOTE: neuron_cache (C5) is threaded only through the streaming path below. This
+        # branch takes no kv_cache at all, so there is no store to reroute.
         if full_attention:
             def attn_residual_func(x: Tensor, pos=None) -> Tensor:
                 return self.ls1(self.attn(self.norm1(x), pos=pos, full_attention=True, enable_3d_rope=enable_3d_rope))
@@ -444,7 +446,7 @@ class CameraBlock(nn.Module):
 
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
             return self.ls1(self.attn(self.norm1(x), pos=pos, block_mask=mask_block, frame_seqlen=frame_seqlen, video_mask=video_mask, current_start=current_start, current_end=current_end, kv_cache=kv_cache, global_idx=global_idx, num_frame_per_block=num_frame_per_block, num_frame_for_scale=num_frame_for_scale, sliding_window_size=effective_sliding_window_size, attend_to_scale_frames=self.attend_to_scale_frames, num_random_frames=self.num_random_frames,
-                                      enable_3d_rope=enable_3d_rope, is_scale_frames=is_scale_frames))
+                                      enable_3d_rope=enable_3d_rope, is_scale_frames=is_scale_frames, neuron_cache=neuron_cache, neuron_slot=neuron_slot))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))

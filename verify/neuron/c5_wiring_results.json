@@ -1,0 +1,113 @@
+{
+  "suite": "C5 wiring (real GCTStream, stock vs C5 in one process)",
+  "device": "cuda",
+  "injected_bug": null,
+  "config": {
+    "checkpoint": "/home/kwehden/lingbot-tier1/models/lingbot-map-long.pt",
+    "image_size": 518,
+    "n_frames": 24,
+    "scale_frames": 4,
+    "sliding_window": 8,
+    "window_size": 12,
+    "overlap": 4,
+    "flow_threshold": 8.0,
+    "max_gap": 6,
+    "keyframe_interval": 3,
+    "max_total_frames": 64,
+    "inject_bug": null,
+    "out": "/home/kwehden/lingbot-tier1/lingbot-map/verify/neuron/c5_wiring_results.json"
+  },
+  "n_checks": 11,
+  "n_fail": 0,
+  "verdict": "PASS",
+  "results": [
+    {
+      "check": "model_is_deterministic_run_to_run",
+      "pass": true,
+      "diffs": {
+        "depth": 0.0,
+        "pose_enc": 0.0
+      },
+      "decisions_match": true,
+      "detail": "Licenses the bit-exact gates below. Without this, a passing comparison could be two identically-noisy runs and a failing one could be framework nondeterminism attributed to C5"
+    },
+    {
+      "check": "decision_mix_is_nontrivial",
+      "pass": true,
+      "n_keyframe": 7,
+      "n_non_keyframe": 13,
+      "detail": "Commit-vs-rollback mix on the flow path. NOTE this does NOT imply the skip_append flag was exercised -- flow mode never sets it (gct_stream_window.py:591-596 commits or rolls back instead). That is what regime 2 below is for, and believing otherwise is what let two injections pass a 9/9 run"
+    },
+    {
+      "check": "cache_installed",
+      "pass": true,
+      "slots": 16,
+      "plan": "TilePlan(n_keys=65, n_tiles=1, tile=128, padded=128)",
+      "detail": "16 independent streams at production; slot = iteration*trunk_depth+block"
+    },
+    {
+      "check": "skip_append_not_honoured_before_first_append",
+      "pass": true,
+      "n_appends": 336,
+      "early_skip": false,
+      "detail": "The GPU's flag lives in dicts that do not exist until the first causal forward and its setter is guarded by kv_cache is not None (gct_stream_window.py:365), so an early set is a silent GPU no-op. Honouring it here would be a permanent off-by-n"
+    },
+    {
+      "check": "predictions_bit_exact",
+      "pass": true,
+      "diffs": {
+        "depth": 0.0,
+        "pose_enc": 0.0
+      },
+      "gate": "torch.equal",
+      "determinism_established": true,
+      "detail": "With no adapter the seam changes only WHERE keys are stored; SDPA then sees the same keys in the same order, so bit-exact is the correct gate (unlike check_c5_attention_parity.py, where the tile/merge legitimately reassociates an fp32 reduction)"
+    },
+    {
+      "check": "decision_sequence_identical",
+      "pass": true,
+      "n_stock": 20,
+      "n_c5": 20,
+      "first_divergence": null,
+      "detail": "One flipped keyframe changes which frames enter the cache, and every later frame then attends a different key set (FM8, REQ-025)"
+    },
+    {
+      "check": "windowed_predictions_bit_exact",
+      "pass": true,
+      "diffs": {
+        "depth": 0.0,
+        "pose_enc": 0.0
+      },
+      "detail": "inference_windowed calls clean_kv_cache once per WINDOW, mid-run (gct_stream_window.py:1094/:1213). Streaming alone never exercises the reset, and the reset is the most dangerous part of the seam"
+    },
+    {
+      "check": "window_boundary_resets_cursor",
+      "pass": true,
+      "n_resets": 2,
+      "detail": "If a boundary does not reset, the next window's visible set carries the previous window's keys (measured: GPU 3 keys vs C5 8, rel_err 0.90)"
+    },
+    {
+      "check": "cache_survives_window_boundary",
+      "pass": true,
+      "still_installed": true,
+      "detail": "clean_kv_cache does `del self.kv_cache`, so holding the cache there got it silently orphaned: the next forward rebuilt the list-of-dicts and resumed torch.cat with no error and no log line. Hence the separate head.neuron_cache attribute"
+    },
+    {
+      "check": "skip_append_regime_is_exercised",
+      "pass": true,
+      "n_appends": 336,
+      "n_with_flag_set": 208,
+      "keyframe_interval": 3,
+      "detail": "Regime 1 (flow) NEVER sets the flag, so this count is the only evidence the non-keyframe store path ran at all. If it is 0 the two checks below are vacuous and skip_append_ignored/drop_pending_frame pass a green run"
+    },
+    {
+      "check": "interval_predictions_bit_exact",
+      "pass": true,
+      "diffs": {
+        "depth": 0.0,
+        "pose_enc": 0.0
+      },
+      "detail": "The non-keyframe store must be right too: the write lands at the cursor, valid_len counts it, and the cursor does NOT advance, so the next keyframe overwrites that row (design.md :712-713). Getting the visible set right but the commit wrong is invisible on the frame itself and diverges one frame later"
+    }
+  ]
+}

@@ -1,9 +1,9 @@
 {
   "suite": "C5 attention-output parity (V5(a) numerical half)",
   "device": "cuda",
-  "injected_bug": "in_prefix_permuted",
+  "injected_bug": null,
   "honour_prior_used_len": true,
-  "n_checks": 4,
+  "n_checks": 7,
   "n_fail": 0,
   "verdict": "PASS",
   "results": [
@@ -16,7 +16,7 @@
     {
       "check": "attention_output_matches_gpu_sdpa",
       "pass": true,
-      "worst_rel_err": "1.456e-06",
+      "worst_rel_err": "1.177e-06",
       "tol": 0.0001,
       "rows": [
         {
@@ -28,19 +28,19 @@
         {
           "frames": 100,
           "seqlen_q": 1,
-          "rel_err": 9.722488130137208e-07,
+          "rel_err": 1.0802764336403925e-06,
           "bit_equal": false
         },
         {
           "frames": 1124,
           "seqlen_q": 1,
-          "rel_err": 1.455916503800836e-06,
+          "rel_err": 1.1771239769586828e-06,
           "bit_equal": false
         },
         {
           "frames": 1124,
           "seqlen_q": 5,
-          "rel_err": 1.034577508107759e-06,
+          "rel_err": 1.1562925692487624e-06,
           "bit_equal": false
         }
       ],
@@ -48,11 +48,32 @@
       "detail": "compute_attention through the real NeuronAttentionAdapter vs F.scaled_dot_product_attention over the identical visible keys. This is the gate the 34-check suite lacks entirely (rel_err defined, never called)"
     },
     {
+      "check": "bit_equality_would_be_the_wrong_gate",
+      "pass": true,
+      "bit_equal_anywhere": false,
+      "floor": "1.177e-06",
+      "detail": "The correct implementation is NOT bit-exact: the tile/merge online-softmax reassociates an fp32 reduction. If this ever passes bit-exactly, the tolerance gate above has become vacuous -- do NOT 'tighten' it to torch.equal"
+    },
+    {
       "check": "prefix_alignment_is_gated",
       "pass": true,
-      "aligned": false,
+      "aligned": true,
       "valid_len": 12,
       "detail": "visible_group's live prefix must equal the reference reshape. valid_len bounds a PHYSICAL prefix, so a transform moving live keys out of [0,valid_len) attends padding and drops real keys -- NOT permutation-invariant, contrary to check_c5_camera_cache.py:332-335's stated rationale"
+    },
+    {
+      "check": "in_prefix_permutation_is_genuinely_harmless",
+      "pass": true,
+      "rel_err": "1.377e-07",
+      "detail": "Softmax IS permutation-invariant inside the live prefix. This is the half of the suite's docstring rationale that is correct, and it is why the alignment gate above must not over-claim"
+    },
+    {
+      "check": "tail_masking_is_load_bearing",
+      "pass": true,
+      "shallow_rel_err": "9.917e-01",
+      "deep_rel_err": "1.420e-02",
+      "tol": 0.0001,
+      "detail": "With prior_used_len ignored, check 1 must fail -- proving it tests the tail mask and not the stub agreeing with itself. Note the error SHRINKS with depth (~0.97 at 8 frames vs ~0.012 at 1124): at production depth a broken tail mask presents as ~1% noise. ODQ7's trn2 half is what confirms the real kernel honours it per tile inside a combine"
     },
     {
       "check": "mismatched_adapter_head_dim_is_rejected",
