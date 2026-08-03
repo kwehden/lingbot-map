@@ -1,0 +1,158 @@
+{
+  "suite": "neuron C1 ring-cache vs FlashInfer (design.md V3)",
+  "device": "cuda",
+  "reference": "REAL flashinfer_cache.FlashInferKVCacheManager (wrapper stubbed)",
+  "n_checks": 19,
+  "n_fail": 0,
+  "verdict": "PASS",
+  "prod_tiling_report": {
+    "patch_plan": {
+      "n_keys": 120472,
+      "n_tiles": 4,
+      "tile": 30208,
+      "padded": 120832
+    },
+    "special_plan": {
+      "n_keys": 6744,
+      "n_tiles": 1,
+      "tile": 6784,
+      "padded": 6784
+    },
+    "num_patch_slots": 88,
+    "headroom": 16,
+    "traversed_keys": 127616,
+    "live_max_keys": 105312,
+    "overhead_pct": 21.18,
+    "n_neff_shapes": 2,
+    "gather_bytes_per_frame_per_block": 481888
+  },
+  "results": [
+    {
+      "check": "device",
+      "pass": true,
+      "device": "cuda",
+      "gpu": "NVIDIA A10G"
+    },
+    {
+      "check": "page_size_is_exact",
+      "pass": true,
+      "page_size": 10,
+      "P": 10
+    },
+    {
+      "check": "win_capacity",
+      "pass": true,
+      "got": 9
+    },
+    {
+      "check": "visible_kv_matches_flashinfer_exactly",
+      "pass": true,
+      "frames": 60,
+      "kept": 52,
+      "rolled_back": 8,
+      "ring_wraps": 4,
+      "detail": "element-for-element identical, K and V, both blocks"
+    },
+    {
+      "check": "ring_actually_wrapped",
+      "pass": true,
+      "wraps": 4,
+      "detail": "if 0, the wrap-correctness checks below are vacuous"
+    },
+    {
+      "check": "rollback_exercised",
+      "pass": true,
+      "n": 8
+    },
+    {
+      "check": "fixed_shapes_across_all_frames",
+      "pass": true,
+      "staging_shapes": 1,
+      "index_lengths": [
+        12
+      ],
+      "detail": "one shape and one index length for every frame -> one NEFF"
+    },
+    {
+      "check": "cache_stats_agree",
+      "pass": true,
+      "detail": "frame_count/scale_pages/live_pages/special_tokens match"
+    },
+    {
+      "check": "naive_prefix_mask_breaks_after_wrap",
+      "pass": true,
+      "live_slots": "[0, 1, 2, 11, 3, 4, 5, 6]",
+      "physical_prefix": "[0, 1, 2, 3, 4, 5, 6, 7]",
+      "detail": "post-wrap the live window is circular, so a physical prefix is the WRONG key set; if this PASSES as a match, the gather was unnecessary"
+    },
+    {
+      "check": "grouped_attention_matches_sdpa_over_gpu_keys",
+      "pass": true,
+      "rel_err": 5.5e-07,
+      "n_tiles": 2,
+      "n_empty_tiles": 0,
+      "n_keys": 392
+    },
+    {
+      "check": "prod_live_keys_match_design_D2",
+      "pass": true,
+      "got": 105312
+    },
+    {
+      "check": "prod_all_tiles_under_kernel_ceiling",
+      "pass": true,
+      "patch_tile": 30208,
+      "special_tile": 6784
+    },
+    {
+      "check": "prod_tiles_are_equal_length_per_group",
+      "pass": true,
+      "patch": "4x30208",
+      "special": "1x6784",
+      "detail": "equal tiles per group -> one NEFF per group (design.md D1a)"
+    },
+    {
+      "check": "prod_traversal_overhead_reported",
+      "pass": true,
+      "traversed": 127616,
+      "live_max": 105312,
+      "overhead_pct": 21.18,
+      "n_neff_shapes": 2,
+      "detail": "cost of fixed shapes + headroom; the perf-vs-GPU number to beat"
+    },
+    {
+      "check": "headroom_2_suffices_for_deferred_eviction",
+      "pass": true,
+      "min_surviving_headroom": 1,
+      "detail": "deferred eviction leaves at most sliding_window+1 frames, so capacity beyond +1 is unused; the GPU's +16 is a page-pool inheritance, not a requirement. Overhead 21.18% -> 2.70% at headroom=2"
+    },
+    {
+      "check": "shipped_default_headroom_survives_and_is_cheap",
+      "pass": true,
+      "default_headroom": 2,
+      "survived": true,
+      "prod_traversed": 108160,
+      "prod_overhead_pct": 2.7,
+      "prod_patch_tiles": "3x33792"
+    },
+    {
+      "check": "special_capacity_divergence_is_ring_stricter",
+      "pass": true,
+      "gpu_frame_limit": 106,
+      "ring_frame_limit": 80,
+      "configured_max_total_frames": 80,
+      "detail": "the GPU over-allocates specials by 16 whole pages, so it raises LATER than max_total_frames; the ring raises exactly AT it. Both honor the configured limit; the ring is strictly stricter. NOT the bit-identical matched failure design.md FM4 assumes -- design.md needs amending"
+    },
+    {
+      "check": "special_exhaustion_raises_naming_max_total_frames",
+      "pass": true,
+      "at_frame": 3,
+      "msg": "block 0: special page pool exhausted at special_token_count=18. Increase max_tot"
+    },
+    {
+      "check": "reset_clears_all_state",
+      "pass": true,
+      "detail": "buffers intentionally NOT reallocated"
+    }
+  ]
+}

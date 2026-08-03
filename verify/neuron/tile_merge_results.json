@@ -1,0 +1,253 @@
+{
+  "suite": "neuron ODQ7 composed-form desk check",
+  "spec": "spec/neuron-port/design.md ODQ7 / D1a / C2",
+  "device": "cuda",
+  "n_checks": 21,
+  "n_fail": 0,
+  "verdict": "PASS",
+  "frame_schedule": [
+    {
+      "frame": 8,
+      "visible": 11000,
+      "tile_valid": [
+        11000,
+        0,
+        0
+      ]
+    },
+    {
+      "frame": 12,
+      "visible": 16500,
+      "tile_valid": [
+        16500,
+        0,
+        0
+      ]
+    },
+    {
+      "frame": 20,
+      "visible": 27500,
+      "tile_valid": [
+        27500,
+        0,
+        0
+      ]
+    },
+    {
+      "frame": 26,
+      "visible": 35750,
+      "tile_valid": [
+        35750,
+        0,
+        0
+      ]
+    },
+    {
+      "frame": 27,
+      "visible": 37125,
+      "tile_valid": [
+        36864,
+        261,
+        0
+      ]
+    },
+    {
+      "frame": 53,
+      "visible": 72875,
+      "tile_valid": [
+        36864,
+        36011,
+        0
+      ]
+    },
+    {
+      "frame": 54,
+      "visible": 74250,
+      "tile_valid": [
+        36864,
+        36864,
+        522
+      ]
+    },
+    {
+      "frame": 72,
+      "visible": 99000,
+      "tile_valid": [
+        36864,
+        36864,
+        25272
+      ]
+    },
+    {
+      "frame": 100,
+      "visible": 99168,
+      "tile_valid": [
+        36864,
+        36864,
+        25440
+      ]
+    },
+    {
+      "frame": 1124,
+      "visible": 105312,
+      "tile_valid": [
+        36864,
+        36864,
+        31584
+      ]
+    }
+  ],
+  "results": [
+    {
+      "check": "device",
+      "pass": true,
+      "device": "cuda",
+      "gpu": "NVIDIA A10G"
+    },
+    {
+      "check": "D1a_tile_count",
+      "pass": true,
+      "got": 3
+    },
+    {
+      "check": "D1a_padded_total",
+      "pass": true,
+      "got": 110592
+    },
+    {
+      "check": "D1a_tile_is_kernel_max",
+      "pass": true,
+      "got": 36864
+    },
+    {
+      "check": "empty_tiles_occur_in_production",
+      "pass": true,
+      "detail": "tiles 1,2 are pure padding for frames <27 -- NOT in design.md",
+      "frame8": "[11000, 0, 0]",
+      "frame1124": "[36864, 36864, 31584]"
+    },
+    {
+      "check": "composed_all_three_tiles_partial_tail_float32",
+      "pass": true,
+      "rel_err": 3e-06,
+      "tol": 0.0001,
+      "valid": 700,
+      "finite": true
+    },
+    {
+      "check": "composed_two_tiles_third_empty_float32",
+      "pass": true,
+      "rel_err": 2e-06,
+      "tol": 0.0001,
+      "valid": 400,
+      "finite": true
+    },
+    {
+      "check": "composed_one_tile_two_empty_float32",
+      "pass": true,
+      "rel_err": 1e-06,
+      "tol": 0.0001,
+      "valid": 200,
+      "finite": true
+    },
+    {
+      "check": "composed_exactly_one_full_tile_float32",
+      "pass": true,
+      "rel_err": 2e-06,
+      "tol": 0.0001,
+      "valid": 256,
+      "finite": true
+    },
+    {
+      "check": "composed_exactly_two_full_tiles_float32",
+      "pass": true,
+      "rel_err": 1e-06,
+      "tol": 0.0001,
+      "valid": 512,
+      "finite": true
+    },
+    {
+      "check": "composed_completely_full_float32",
+      "pass": true,
+      "rel_err": 3e-06,
+      "tol": 0.0001,
+      "valid": 768,
+      "finite": true
+    },
+    {
+      "check": "composed_all_three_tiles_partial_tail_bfloat16",
+      "pass": true,
+      "rel_err": 0.00304,
+      "tol": 0.02,
+      "valid": 700,
+      "finite": true
+    },
+    {
+      "check": "composed_two_tiles_third_empty_bfloat16",
+      "pass": true,
+      "rel_err": 0.003705,
+      "tol": 0.02,
+      "valid": 400,
+      "finite": true
+    },
+    {
+      "check": "composed_one_tile_two_empty_bfloat16",
+      "pass": true,
+      "rel_err": 0.001959,
+      "tol": 0.02,
+      "valid": 200,
+      "finite": true
+    },
+    {
+      "check": "composed_exactly_one_full_tile_bfloat16",
+      "pass": true,
+      "rel_err": 0.002636,
+      "tol": 0.02,
+      "valid": 256,
+      "finite": true
+    },
+    {
+      "check": "composed_exactly_two_full_tiles_bfloat16",
+      "pass": true,
+      "rel_err": 0.00392,
+      "tol": 0.02,
+      "valid": 512,
+      "finite": true
+    },
+    {
+      "check": "composed_completely_full_bfloat16",
+      "pass": true,
+      "rel_err": 0.003943,
+      "tol": 0.02,
+      "valid": 768,
+      "finite": true
+    },
+    {
+      "check": "convention_B_fails_as_expected",
+      "pass": true,
+      "rel_err": 0.601505,
+      "detail": "if this PASSES, the composed test is vacuous"
+    },
+    {
+      "check": "empty_tile_neutralisation_is_load_bearing",
+      "pass": true,
+      "masked_rel_err": 1.18e-06,
+      "unmasked_rel_err": 0.554635,
+      "detail": "unmasked empty tiles dominate the merge -- the hazard design.md missed"
+    },
+    {
+      "check": "merge_invariant_to_tile_count",
+      "pass": true,
+      "tile128_n6": 1.69e-06,
+      "tile192_n4": 1.6e-06,
+      "tile256_n3": 1.69e-06,
+      "tile384_n2": 1.95e-06,
+      "tile768_n1": 2.04e-06
+    },
+    {
+      "check": "valid_lens_stay_on_device",
+      "pass": true,
+      "types": "['Tensor', 'Tensor', 'Tensor']"
+    }
+  ]
+}
