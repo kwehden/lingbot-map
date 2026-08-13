@@ -30,9 +30,11 @@ tolerance policy:
    accompanying injections prove it discriminates.
 4. ``tail_masking_is_load_bearing`` — the ODQ7 dependency, made a check. Re-runs with the
    stub ignoring ``prior_used_len`` and asserts check 1 fails. Records the magnitude, which
-   is the uncomfortable part: ~0.97 at 8 frames but ~**0.012** at 1124 frames, because the
-   live fraction grows with depth. A broken tail mask presents as 1% noise at production
-   depth, so "the numbers look close" is not evidence here.
+   is the uncomfortable part: measured **9.917e-01** at 8 frames but **1.420e-02** at 1124
+   frames (``c5_attention_parity_results.json``), because the live fraction grows with
+   depth. A broken tail mask presents as ~1% noise at production depth, so "the numbers
+   look close" is not evidence here. The run's own ``shallow_rel_err``/``deep_rel_err``
+   fields are authoritative; these two name their artifact rather than floating free of it.
 
 Run::
 
@@ -284,8 +286,10 @@ def main() -> int:
     # stub's agreement with itself.
     #
     # The magnitudes are the reason this is a check and not a comment: unhonoured padding
-    # costs rel_err ~0.97 at 8 frames but only ~0.012 at 1124, because the live fraction
-    # grows. At production depth a broken tail mask looks like 1% noise, not a bug.
+    # cost rel_err 9.917e-01 at 8 frames but only 1.420e-02 at 1124 in the committed run
+    # (c5_attention_parity_results.json), because the live fraction grows. At production
+    # depth a broken tail mask looks like ~1% noise, not a bug. Do not restate those as
+    # rounded prose again -- the emit() below interpolates what THIS run measured.
     if args.inject is None:
         install_cte_stub(honour_prior_used_len=False)
         deep_err = shallow_err = 0.0
@@ -303,9 +307,11 @@ def main() -> int:
              shallow_rel_err=f"{shallow_err:.3e}", deep_rel_err=f"{deep_err:.3e}", tol=TOL,
              detail="With prior_used_len ignored, check 1 must fail -- proving it tests the "
                     "tail mask and not the stub agreeing with itself. Note the error SHRINKS "
-                    "with depth (~0.97 at 8 frames vs ~0.012 at 1124): at production depth a "
-                    "broken tail mask presents as ~1% noise. ODQ7's trn2 half is what "
-                    "confirms the real kernel honours it per tile inside a combine")
+                    f"with depth ({shallow_err:.3e} at 8 frames vs {deep_err:.3e} at {MTF}): "
+                    f"at production depth a broken tail mask presents as {deep_err:.1%} "
+                    "noise. Figures interpolated from this run, never restated -- the fields "
+                    "above are the same two numbers. ODQ7's trn2 half is what confirms the "
+                    "real kernel honours it per tile inside a combine")
 
     # ---- 6. adapter geometry guard ----------------------------------------------------
     trunk_like = NeuronAttentionAdapter(head_dim=64, max_seqlen_k=1152, tile=1152,
