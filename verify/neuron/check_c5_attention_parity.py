@@ -45,8 +45,25 @@ Run::
 
     python3 verify/neuron/check_c5_attention_parity.py
     python3 verify/neuron/check_c5_attention_parity.py --inject axes_mixed
-    python3 verify/neuron/check_c5_attention_parity.py --measure-reference-floor \
-        --tensors-out /path/outside/this/repo
+
+The floor measurement needs the Tier 1 container, and two things about that container
+determine the invocation. There is no ``git`` in it, so provenance has to be handed in from
+the host; and only ``/home/kwehden/lingbot-tier1`` is mounted, so a ``--tensors-out`` anywhere
+else writes into the container's own filesystem and the retained tensors do not survive it --
+the guard passes against files the host cannot see. Both are easy to get wrong silently::
+
+    H=verify/neuron/check_c5_attention_parity.py
+    docker exec \
+      -e LINGBOT_HARNESS_REV="$(git rev-parse HEAD)" \
+      -e LINGBOT_HARNESS_BRANCH="$(git rev-parse --abbrev-ref HEAD)" \
+      -e LINGBOT_HARNESS_DIRTY="$([ -n "$(git status --porcelain -- $H)" ] && echo 1 || echo 0)" \
+      lingbot-tier1 python "$PKG/verify/neuron/check_c5_attention_parity.py" \
+        --measure-reference-floor \
+        --tensors-out /home/kwehden/lingbot-tier1/c5_floor_tensors_<date>
+
+``LINGBOT_HARNESS_DIRTY`` is computed over the harness **source**, not over
+``verify/neuron/``: the run writes its own artifact into that directory, so a directory-scoped
+status makes every run after the first report dirty whatever the code did.
 
 Exit codes. The parity suite uses ``0`` pass / ``1`` fail. ``--measure-reference-floor`` adds
 two, because "measured" and "usable as a tolerance bar" are different answers:
