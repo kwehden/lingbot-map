@@ -1,0 +1,450 @@
+{
+  "suite": "reference_floor(C5) across implementations (TASK-N08 owed step 3)",
+  "device": "cuda",
+  "gpu": "NVIDIA A10G",
+  "not_reportable": false,
+  "harness_revision": {
+    "source": "caller_asserted_env",
+    "commit": "eaef582750ea622407747c117e4ed599de53e2fb",
+    "branch": "neuron-port",
+    "dirty": false,
+    "self_observation_unavailable_because": "FileNotFoundError: [Errno 2] No such file or directory: 'git'",
+    "caveat": "supplied by the caller and NOT verified by this harness -- weaker evidence than self_observed_git, and a caller that supplied the wrong SHA would not be caught here"
+  },
+  "geometry": {
+    "frames": [
+      8,
+      100,
+      1124
+    ],
+    "seqlen_q": [
+      1,
+      5
+    ],
+    "num_heads": 16,
+    "head_dim": 128,
+    "max_total_frames": 1124,
+    "input_dtypes": [
+      "torch.float32"
+    ],
+    "plan": "plan_tiles(1124 + 1) = 1 tile x 1152"
+  },
+  "family": {
+    "sdpa_fused": "F.scaled_dot_product_attention over the live keys -- the existing reference, one fused kernel",
+    "adapter_einsum": "compute_attention through the real NeuronAttentionAdapter: einsum-ordered explicit softmax, scale folded into q, merge at one part. This member's disagreement with sdpa_fused is the ~1.2e-6 TASK-N08 recorded in 2026-08-03 -- which is what makes that figure ONE MEMBER of the family and not the floor",
+    "chunked_merge": "the same explicit softmax with the key reduction split across FLOOR_PARTS parts and recombined by the production merge_online_softmax",
+    "in_prefix_permuted": "compute_attention with the live prefix permuted inside [0, valid_len) -- exact-arithmetic-invariant by policy point 2, recorded there at ~1e-7"
+  },
+  "reference_floor_c5": 1.7101056073443033e-06,
+  "reference_floor_at": {
+    "frames": 100,
+    "seqlen_q": 1,
+    "pair": "in_prefix_permuted|sdpa_fused"
+  },
+  "floor_usable_as_a_bar": true,
+  "cross_device": false,
+  "cross_device_note": "every member ran on one device and two of the four went through install_cte_stub(), so this reaches one axis short of cross-device. It bounds evaluation-order disagreement, not Neuron-vs-GPU disagreement",
+  "supersedes": "the analytic n*u interim 1.37e-4 named in TASK-N21's Phase 4 floor, which bounds neither this comparison nor the value taken from it",
+  "worst_ulp_output_rel_move": 8.297145654978522e-07,
+  "cells": [
+    {
+      "frames": 8,
+      "seqlen_q": 1,
+      "seed": 20260894,
+      "members_completed": 4,
+      "members_failed": {},
+      "chunked_spans": [
+        [
+          0,
+          2
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          5,
+          8
+        ]
+      ],
+      "n_parts_requested": 3,
+      "pairs": [
+        {
+          "pair": "adapter_einsum|chunked_merge",
+          "rel_err": 1.915050944489849e-07
+        },
+        {
+          "pair": "adapter_einsum|in_prefix_permuted",
+          "rel_err": 1.915050944489849e-07
+        },
+        {
+          "pair": "adapter_einsum|sdpa_fused",
+          "rel_err": 4.4684531985694775e-07
+        },
+        {
+          "pair": "chunked_merge|in_prefix_permuted",
+          "rel_err": 1.5958757160206005e-07
+        },
+        {
+          "pair": "chunked_merge|sdpa_fused",
+          "rel_err": 4.4684531985694775e-07
+        },
+        {
+          "pair": "in_prefix_permuted|sdpa_fused",
+          "rel_err": 4.4684531985694775e-07
+        }
+      ],
+      "cell_max_rel_err": 4.4684531985694775e-07,
+      "bit_identical_pairs": [],
+      "ulp_probe": {
+        "input_rel_move": 1.0887226409295181e-07,
+        "output_rel_move": 4.4684531985694775e-07,
+        "kappa": 4.104308141102355
+      },
+      "retained_tensors": {
+        "path": "/home/kwehden/lingbot-tier1/c5_floor_tensors_2026-08-13/c5_floor_8f_sq1.pt",
+        "sha256": "3978f6489e4811b508a65a66488bb0b0d679c2551023df8bd567f3ecec2cb2ae",
+        "bytes": 175260
+      }
+    },
+    {
+      "frames": 8,
+      "seqlen_q": 5,
+      "seed": 20260898,
+      "members_completed": 4,
+      "members_failed": {},
+      "chunked_spans": [
+        [
+          0,
+          2
+        ],
+        [
+          2,
+          5
+        ],
+        [
+          5,
+          8
+        ]
+      ],
+      "n_parts_requested": 3,
+      "pairs": [
+        {
+          "pair": "adapter_einsum|chunked_merge",
+          "rel_err": 1.5131942632251594e-07
+        },
+        {
+          "pair": "adapter_einsum|in_prefix_permuted",
+          "rel_err": 1.8158333148221573e-07
+        },
+        {
+          "pair": "adapter_einsum|sdpa_fused",
+          "rel_err": 9.079167284653522e-07
+        },
+        {
+          "pair": "chunked_merge|in_prefix_permuted",
+          "rel_err": 1.8158333148221573e-07
+        },
+        {
+          "pair": "chunked_merge|sdpa_fused",
+          "rel_err": 7.868611646699719e-07
+        },
+        {
+          "pair": "in_prefix_permuted|sdpa_fused",
+          "rel_err": 7.868611646699719e-07
+        }
+      ],
+      "cell_max_rel_err": 9.079167284653522e-07,
+      "bit_identical_pairs": [],
+      "ulp_probe": {
+        "input_rel_move": 1.0902549973934583e-07,
+        "output_rel_move": 6.658056008745916e-07,
+        "kappa": 6.106879605838774
+      },
+      "retained_tensors": {
+        "path": "/home/kwehden/lingbot-tier1/c5_floor_tensors_2026-08-13/c5_floor_8f_sq5.pt",
+        "sha256": "2dfa98f7a6e890e8d79ad3449cfe159ec6fa191d17a04a4b487f7fe9d03d0193",
+        "bytes": 339100
+      }
+    },
+    {
+      "frames": 100,
+      "seqlen_q": 1,
+      "seed": 20261814,
+      "members_completed": 4,
+      "members_failed": {},
+      "chunked_spans": [
+        [
+          0,
+          33
+        ],
+        [
+          33,
+          66
+        ],
+        [
+          66,
+          100
+        ]
+      ],
+      "n_parts_requested": 3,
+      "pairs": [
+        {
+          "pair": "adapter_einsum|chunked_merge",
+          "rel_err": 1.3680823940376285e-07
+        },
+        {
+          "pair": "adapter_einsum|in_prefix_permuted",
+          "rel_err": 2.7361650722923514e-07
+        },
+        {
+          "pair": "adapter_einsum|sdpa_fused",
+          "rel_err": 1.5048929071781458e-06
+        },
+        {
+          "pair": "chunked_merge|in_prefix_permuted",
+          "rel_err": 2.052123875273537e-07
+        },
+        {
+          "pair": "chunked_merge|sdpa_fused",
+          "rel_err": 1.573297140566865e-06
+        },
+        {
+          "pair": "in_prefix_permuted|sdpa_fused",
+          "rel_err": 1.7101056073443033e-06
+        }
+      ],
+      "cell_max_rel_err": 1.7101056073443033e-06,
+      "bit_identical_pairs": [],
+      "ulp_probe": {
+        "input_rel_move": 1.055537524052852e-07,
+        "output_rel_move": 3.420211385218863e-07,
+        "kappa": 3.240255611270537
+      },
+      "retained_tensors": {
+        "path": "/home/kwehden/lingbot-tier1/c5_floor_tensors_2026-08-13/c5_floor_100f_sq1.pt",
+        "sha256": "6f80d43cb5d7b9f71d2fd2cc169a94ecf8301fd38d90f879b86be754831d0ef5",
+        "bytes": 1682610
+      }
+    },
+    {
+      "frames": 100,
+      "seqlen_q": 5,
+      "seed": 20261818,
+      "members_completed": 4,
+      "members_failed": {},
+      "chunked_spans": [
+        [
+          0,
+          33
+        ],
+        [
+          33,
+          66
+        ],
+        [
+          66,
+          100
+        ]
+      ],
+      "n_parts_requested": 3,
+      "pairs": [
+        {
+          "pair": "adapter_einsum|chunked_merge",
+          "rel_err": 2.0766728425769543e-07
+        },
+        {
+          "pair": "adapter_einsum|in_prefix_permuted",
+          "rel_err": 2.076672700468407e-07
+        },
+        {
+          "pair": "adapter_einsum|sdpa_fused",
+          "rel_err": 1.0383372455180506e-06
+        },
+        {
+          "pair": "chunked_merge|in_prefix_permuted",
+          "rel_err": 2.0766728425769543e-07
+        },
+        {
+          "pair": "chunked_merge|sdpa_fused",
+          "rel_err": 1.10755979676469e-06
+        },
+        {
+          "pair": "in_prefix_permuted|sdpa_fused",
+          "rel_err": 1.0383372455180506e-06
+        }
+      ],
+      "cell_max_rel_err": 1.10755979676469e-06,
+      "bit_identical_pairs": [],
+      "ulp_probe": {
+        "input_rel_move": 1.1027949398112469e-07,
+        "output_rel_move": 5.53779898382345e-07,
+        "kappa": 5.021603549224929
+      },
+      "retained_tensors": {
+        "path": "/home/kwehden/lingbot-tier1/c5_floor_tensors_2026-08-13/c5_floor_100f_sq5.pt",
+        "sha256": "9b8ac2a76591763e6ff27f34d683cd1f5bb205dba16d8cdd5351ecbf0ee9ac8e",
+        "bytes": 1846450
+      }
+    },
+    {
+      "frames": 1124,
+      "seqlen_q": 1,
+      "seed": 20272054,
+      "members_completed": 4,
+      "members_failed": {},
+      "chunked_spans": [
+        [
+          0,
+          374
+        ],
+        [
+          374,
+          749
+        ],
+        [
+          749,
+          1124
+        ]
+      ],
+      "n_parts_requested": 3,
+      "pairs": [
+        {
+          "pair": "adapter_einsum|chunked_merge",
+          "rel_err": 4.5777323975926265e-07
+        },
+        {
+          "pair": "adapter_einsum|in_prefix_permuted",
+          "rel_err": 3.8147763348206354e-07
+        },
+        {
+          "pair": "adapter_einsum|sdpa_fused",
+          "rel_err": 1.2207294730615104e-06
+        },
+        {
+          "pair": "chunked_merge|in_prefix_permuted",
+          "rel_err": 3.43329929819447e-07
+        },
+        {
+          "pair": "chunked_merge|sdpa_fused",
+          "rel_err": 1.1444338952060207e-06
+        },
+        {
+          "pair": "in_prefix_permuted|sdpa_fused",
+          "rel_err": 1.1444338952060207e-06
+        }
+      ],
+      "cell_max_rel_err": 1.2207294730615104e-06,
+      "bit_identical_pairs": [],
+      "ulp_probe": {
+        "input_rel_move": 9.286613789072362e-08,
+        "output_rel_move": 8.297145654978522e-07,
+        "kappa": 8.934522144919868
+      },
+      "retained_tensors": {
+        "path": "/home/kwehden/lingbot-tier1/c5_floor_tensors_2026-08-13/c5_floor_1124f_sq1.pt",
+        "sha256": "b15c7dea1284b9b820c563a438956d5edbe79fd93f42d53b861999b40bcfe1e2",
+        "bytes": 18459837
+      }
+    },
+    {
+      "frames": 1124,
+      "seqlen_q": 5,
+      "seed": 20272058,
+      "members_completed": 4,
+      "members_failed": {},
+      "chunked_spans": [
+        [
+          0,
+          374
+        ],
+        [
+          374,
+          749
+        ],
+        [
+          749,
+          1124
+        ]
+      ],
+      "n_parts_requested": 3,
+      "pairs": [
+        {
+          "pair": "adapter_einsum|chunked_merge",
+          "rel_err": 2.8806778118450893e-07
+        },
+        {
+          "pair": "adapter_einsum|in_prefix_permuted",
+          "rel_err": 2.8806780960621836e-07
+        },
+        {
+          "pair": "adapter_einsum|sdpa_fused",
+          "rel_err": 1.555567678224179e-06
+        },
+        {
+          "pair": "chunked_merge|in_prefix_permuted",
+          "rel_err": 3.4568137152746203e-07
+        },
+        {
+          "pair": "chunked_merge|sdpa_fused",
+          "rel_err": 1.6131812117237132e-06
+        },
+        {
+          "pair": "in_prefix_permuted|sdpa_fused",
+          "rel_err": 1.555567678224179e-06
+        }
+      ],
+      "cell_max_rel_err": 1.6131812117237132e-06,
+      "bit_identical_pairs": [],
+      "ulp_probe": {
+        "input_rel_move": 9.867245864825236e-08,
+        "output_rel_move": 7.201701919257175e-07,
+        "kappa": 7.298593769645294
+      },
+      "retained_tensors": {
+        "path": "/home/kwehden/lingbot-tier1/c5_floor_tensors_2026-08-13/c5_floor_1124f_sq5.pt",
+        "sha256": "58031f8f63be7a145d3006d94c9f3c48eb2c6c12b107dabe9746472e8ef049c9",
+        "bytes": 18623677
+      }
+    }
+  ],
+  "n_checks": 4,
+  "n_fail": 0,
+  "verdict": "MEASURED",
+  "results": [
+    {
+      "check": "floor_geometry_fully_covered",
+      "pass": true,
+      "cells": 6,
+      "expected": 6,
+      "cells_under_three_members": [],
+      "input_dtypes": [
+        "torch.float32"
+      ],
+      "detail": "owed step 3 requires the maximum over the FULL geometry at fp32: every frames x seqlen_q cell present, and at least three of the four evaluations completing in each. A maximum over whichever cells happened to run is not the maximum, and a floor measured at another dtype is not this shape's floor"
+    },
+    {
+      "check": "floor_family_members_disagree",
+      "pass": true,
+      "floor": "1.710e-06",
+      "cells_with_zero_spread": [],
+      "detail": "a family that agrees bit-exactly measured nothing, and per policy point 1 bit-equality is this harness's failure signal rather than a tight result. Two members differing is the whole content of the measurement"
+    },
+    {
+      "check": "per_implementation_outputs_retained",
+      "pass": true,
+      "tensors_out": "/home/kwehden/lingbot-tier1/c5_floor_tensors_2026-08-13",
+      "cells_missing_tensors": [],
+      "detail": "a bare maximum with no retained members cannot be re-derived when REQ-088's SDK tuple moves -- the same rule TASK-N21's vacuity guard applies to its repeats. Pass --tensors-out pointing OUTSIDE this repository: both of its remotes are public and the deep cells are ~19 MB of tensors each. The path and sha256 land in this artifact so the figures stay traceable to bytes"
+    },
+    {
+      "check": "ulp_amplification_does_not_dominate_the_family",
+      "pass": true,
+      "worst_output_rel_move": "8.297e-07",
+      "floor": "1.710e-06",
+      "cells_probed": "6/6",
+      "worst_kappa": 8.934522144919868,
+      "detail": "the family measures sensitivity to evaluation ORDER; this probe measures sensitivity to the INPUTS at one ulp. Both numbers are measured, and the comparison is between them -- no absolute cutoff is applied, because a cutoff would decide the outcome instead of the measurement. If a one-ulp input move shifts the output as far as the whole family spread, the order-derived maximum is not representative of this shape: it is a finding to escalate per owed step 3, not a bar to score Phase 4 against"
+    }
+  ]
+}
