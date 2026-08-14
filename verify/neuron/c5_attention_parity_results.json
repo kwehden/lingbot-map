@@ -73,7 +73,7 @@
       "shallow_rel_err": "9.917e-01",
       "deep_rel_err": "1.420e-02",
       "tol": 0.0001,
-      "detail": "With prior_used_len ignored, check 1 must fail -- proving it tests the tail mask and not the stub agreeing with itself. Note the error SHRINKS with depth (~0.97 at 8 frames vs ~0.012 at 1124): at production depth a broken tail mask presents as ~1% noise. ODQ7's trn2 half is what confirms the real kernel honours it per tile inside a combine"
+      "detail": "With prior_used_len ignored, check 1 must fail -- proving it tests the tail mask and not the stub agreeing with itself. Note the error SHRINKS with depth (9.917e-01 at 8 frames vs 1.420e-02 at 1124): at production depth a broken tail mask presents as 1.4% noise. Figures interpolated from this run, never restated -- the fields above are the same two numbers. ODQ7's trn2 half is what confirms the real kernel honours it per tile inside a combine"
     },
     {
       "check": "mismatched_adapter_head_dim_is_rejected",

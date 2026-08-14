@@ -41,6 +41,15 @@ runs ``TASK-N08`` owed step 3 and writes its own artifact. It does **not** run t
 above and does not touch their artifact, because the 7/7 verdict is cited elsewhere and a
 measurement is not a member of it. See the block above :func:`measure_reference_floor`.
 
+A sixth, added 2026-08-14, is ``TASK-N08`` owed step 1: ``--arm neuron`` selects the real
+kernel instead of the stub. Everything above runs against ``install_cte_stub()``, which is what
+makes it desk-runnable and is also the one thing that could make a *compiled* run vacuous — a
+trn2 run that reports the stub's numbers has measured the desk twice. The arm therefore leaves
+``NeuronAttentionAdapter._load_kernel`` alone, lets the real import happen, and records which
+kernel it got, and it scores that provenance **before** it scores any ``rel_err``. See the
+block above :func:`run_neuron_arm`. Authoring the arm is desk work; its first *execution* is
+Tier 2 and belongs to ``TASK-N21``'s C5-shape floor or ``TASK-N14a``.
+
 Run::
 
     python3 verify/neuron/check_c5_attention_parity.py
@@ -65,16 +74,22 @@ the guard passes against files the host cannot see. Both are easy to get wrong s
 ``verify/neuron/``: the run writes its own artifact into that directory, so a directory-scoped
 status makes every run after the first report dirty whatever the code did.
 
-Exit codes. The parity suite uses ``0`` pass / ``1`` fail. ``--measure-reference-floor`` adds
-two, because "measured" and "usable as a tolerance bar" are different answers:
+Exit codes. The parity suite uses ``0`` pass / ``1`` fail. The two measuring modes add two more,
+because "measured" and "usable as a verdict" are different answers:
 
 ===  ==========================================================================
- 0   MEASURED -- every guard passed and ``reference_floor_c5`` may be consumed
- 1   a guard failed; the floor is not established
- 2   ESCALATE -- measured, but a one-ulp input move rivals the whole family
-     spread, so the maximum is a finding and not a bar (``TASK-N08`` owed
-     step 3's own words)
- 3   BLOCKED -- no CUDA device; this is an A10G desk measurement
+ 0   MEASURED -- every guard passed and the figure may be consumed
+ 1   a guard failed; the figure is not established
+ 2   measured, but not consumable as a bar or a verdict here.
+     ``--measure-reference-floor``: ESCALATE, a one-ulp input move rivals the
+     whole family spread, so the maximum is a finding and not a bar
+     (``TASK-N08`` owed step 3's own words). ``--arm neuron``: the discrepancy
+     was measured and no ``--tolerance`` was supplied to score it against, so
+     it is a number no gate consumed -- never read this as a pass.
+ 3   BLOCKED -- this venue cannot perform the requested measurement, and
+     ``blocked_because`` in the artifact names which venue property is
+     missing: ``no_cuda`` for the floor (an A10G desk measurement),
+     ``neuron_env_not_configured`` or ``neuron_kernel_unavailable`` for the arm
 ===  ==========================================================================
 
 Nothing in ``attention.py``/``camera_head.py`` is edited; the GPU reference is only a valid
@@ -120,14 +135,31 @@ def emit(check: str, ok: bool, **kw) -> None:
           + ("".join(f"\n           {k}={v}" for k, v in kw.items()) if kw else ""))
 
 
+# The shipped method, captured at import before anything in this process can patch it, and the
+# witness list that records every patch that did happen. Both exist for the Neuron arm's vacuity
+# guards, and both have to be taken HERE rather than inside the arm: an arm that reads
+# _load_kernel after the fact cannot tell a pristine method from one the stub restored, and
+# "install_cte_stub() was never called" asserted by the caller is exactly the claim that needs
+# evidence. STUB_INSTALLS is appended by install_cte_stub itself, so the evidence is produced by
+# the thing being ruled out and not by the code hoping it did not happen.
+_PRISTINE_LOAD_KERNEL = NeuronAttentionAdapter._load_kernel
+STUB_INSTALLS: list = []
+
+
 # ------------------------------------------------------------------------------------
 # The kernel fake. Convention A, exactly as check_tile_merge.py pins it: attention over
 # k_prior[:prior_used_len] ++ k_active, returning (out, neg_max, sum_recip) when
 # cache_softmax=True. This is the contract V2 confirmed on trn2 hardware; faking it here
 # keeps the check desk-runnable. The tail-masking half is what ODQ7's trn2 half must confirm.
 # ------------------------------------------------------------------------------------
-def install_cte_stub(honour_prior_used_len: bool = True):
-    """Patch ``NeuronAttentionAdapter._load_kernel`` (the instance method the adapter calls).
+def make_cte_stub(honour_prior_used_len: bool = True):
+    """Build the fake kernel and return it, **without** installing it anywhere.
+
+    Split out from :func:`install_cte_stub` so that "make the fake" and "patch the adapter" are
+    separable: the Neuron arm's guards treat any patch as disqualifying, so a test that needs a
+    callable kernel without a patch (and without a witness entry it would then have to explain
+    away) has to be able to get one. Every caller in the checks above wants both and calls
+    :func:`install_cte_stub`.
 
     Layouts follow the real call site (``neuron_attention.py:368-374``), and they are
     asymmetric: ``q_k`` is ``[H, seqlen_q, D]`` seq-major, ``k_t`` is ``[H, D, tile]``
@@ -164,20 +196,44 @@ def install_cte_stub(honour_prior_used_len: bool = True):
             return out.to(q_k.dtype), neg_max, (1.0 / s)
         return out.to(q_k.dtype)
 
-    NeuronAttentionAdapter._load_kernel = lambda self: stub        # noqa: SLF001
     return stub
 
 
-def build(head_dim=128, num_heads=16, mtf=1124, device="cpu", adapter=True):
-    ad = None
-    if adapter:
-        probe = NeuronCameraCache(num_iterations=1, trunk_depth=1, num_heads=num_heads,
-                                  head_dim=head_dim, device=device, max_total_frames=mtf)
-        ad = NeuronAttentionAdapter(head_dim=head_dim, max_seqlen_k=probe.plan.padded,
-                                    tile=probe.plan.tile, check_env=False)
+def install_cte_stub(honour_prior_used_len: bool = True):
+    """Patch ``NeuronAttentionAdapter._load_kernel`` (the instance method the adapter calls)."""
+    stub = make_cte_stub(honour_prior_used_len)
+    NeuronAttentionAdapter._load_kernel = lambda self: stub        # noqa: SLF001
+    # The witness. Recorded unconditionally, including the caller's line, so the arm's
+    # "the stub was never installed in this process" guard is evidence rather than a hope.
+    frame = sys._getframe(1)                                       # noqa: SLF001
+    STUB_INSTALLS.append({"honour_prior_used_len": bool(honour_prior_used_len),
+                          "called_from": f"{os.path.basename(frame.f_code.co_filename)}:"
+                                         f"{frame.f_lineno} in {frame.f_code.co_name}"})
+    return stub
+
+
+def build_with_adapter(head_dim, num_heads, mtf, device, check_env):
+    """The one construction site, returning ``(cache, adapter)``.
+
+    ``check_env`` is a parameter and not a constant because the two arms need opposite answers:
+    the stub arm must skip ``_assert_env`` (no Neuron env exists at the desk and the kernel is
+    fake anyway), and the Neuron arm must NOT skip it, since ``check_env=False`` is precisely
+    how a run reaches ``_load_kernel`` on a host that was never configured for Trainium.
+    """
+    probe = NeuronCameraCache(num_iterations=1, trunk_depth=1, num_heads=num_heads,
+                              head_dim=head_dim, device=device, max_total_frames=mtf)
+    ad = NeuronAttentionAdapter(head_dim=head_dim, max_seqlen_k=probe.plan.padded,
+                                tile=probe.plan.tile, check_env=check_env)
     return NeuronCameraCache(num_iterations=1, trunk_depth=1, num_heads=num_heads,
                              head_dim=head_dim, device=device, max_total_frames=mtf,
-                             attention_adapter=ad)
+                             attention_adapter=ad), ad
+
+
+def build(head_dim=128, num_heads=16, mtf=1124, device="cpu", adapter=True):
+    if not adapter:
+        return NeuronCameraCache(num_iterations=1, trunk_depth=1, num_heads=num_heads,
+                                 head_dim=head_dim, device=device, max_total_frames=mtf)
+    return build_with_adapter(head_dim, num_heads, mtf, device, check_env=False)[0]
 
 
 def drive(c5, n_frames, num_heads, head_dim, device, gen):
@@ -190,6 +246,20 @@ def drive(c5, n_frames, num_heads, head_dim, device, gen):
         ks.append(k[0, :, 0, 0, :])          # [H, D]
         vs.append(v[0, :, 0, 0, :])
     return torch.stack(ks, 0), torch.stack(vs, 0)     # [n, H, D]
+
+
+def replay(c5, k_nhd, v_nhd, num_heads, head_dim):
+    """Rebuild the cache state from staged ``[n, H, D]`` k/v instead of from a generator.
+
+    The Neuron arm cannot use :func:`drive` with the recorded seed. ``torch.Generator`` is
+    device-scoped: a generator seeded N on one device does not produce another device's stream,
+    so reseeding on trn2 would silently attend different keys than the staged reference was
+    computed from -- the comparison would still print a number. Replaying the tensors is why
+    owed step 2 stages them, and ``append`` is a copy, so the replayed prefix is bit-exact.
+    """
+    for i in range(int(k_nhd.shape[0])):
+        c5.append(0, 0, k_nhd[i].reshape(1, num_heads, 1, 1, head_dim),
+                  v_nhd[i].reshape(1, num_heads, 1, 1, head_dim))
 
 
 def gpu_sdpa(q_bhsd, k_nhd, v_nhd):
@@ -580,6 +650,330 @@ def measure_reference_floor(args) -> int:
     return code
 
 
+# ------------------------------------------------------------------------------------------
+# The Neuron arm -- TASK-N08 owed step 1 (added 2026-08-14)
+#
+# WHAT THE ARM IS FOR. Every check above runs against install_cte_stub(). That is correct for
+# desk work and it is the only reason this file exists at the desk, but it means the numbers
+# above are GPU-vs-GPU: REQ-086 makes invoking nkilib.core.attention.attention_cte the
+# definition of "real Trainium/Inferentia hardware" for REQ-028, and the stub is not it. So a
+# compiled trn2 run that reports the stub's figures has measured the desk twice and satisfied
+# nothing. That is this arm's own vacuity failure mode, and it is the specific way a silent
+# fallback would pass: the stub agrees with the GPU reference to ~1e-6, so a fallback looks
+# exactly like a success.
+#
+# HOW IT IS PREVENTED, AND WHY IN THIS ORDER. The arm scores kernel provenance BEFORE it scores
+# any rel_err, and returns without computing one if provenance fails -- a discrepancy figure
+# produced by an unknown kernel is not a weaker result, it is a misleading one. The three
+# provenance guards are: install_cte_stub() was never called in this process (witnessed by
+# STUB_INSTALLS, which install_cte_stub appends itself), _load_kernel is still the shipped
+# method (identity against _PRISTINE_LOAD_KERNEL, captured at import), and the object the real
+# _load_kernel returned lives under nkilib.
+#
+# WHY check_env=True HERE. The adapter's _assert_env() wants PJRT_DEVICE=NEURON and
+# NEURON_PLATFORM_TARGET_OVERRIDE=trn2, each of which cost a real trn2 run to learn. The arm
+# must not skip it: check_env=False is how a run reaches _load_kernel on a host nobody
+# configured. But note carefully what an env failure does and does not show. Blocking because
+# the env vars are unset is NOT evidence that the arm raises rather than falling back -- it
+# never reached the import. The two blocks are therefore separate causes with separate fields,
+# and raises_rather_than_falling_back stays null in the env case rather than claiming a
+# property this run did not exercise.
+#
+# WHAT IT COMPARES AGAINST. Owed step 2's staged tensors, and nothing else. A CPU SDPA computed
+# on the trn2 host cannot discharge REQ-021's GPU comparison (the 2026-08-08 review's P1), and
+# reseeding drive() on another device attends different keys than the reference was computed
+# from (see :func:`replay`). Staging is transport, not trust, so every staged file is verified
+# against the sha256 the floor artifact committed before its contents are used. Unlike that
+# artifact this comparison IS cross-device, which is the axis it exists to cover.
+#
+# WHAT IT DOES NOT DECIDE. No tolerance is hardcoded. TASK-N21's Phase 4 bar is
+# max(reference_floor, 3 x noise_floor) and belongs to that task; the harness's own "generous"
+# TOL=1e-4 above is not a derivation and must not become one by being reused here. --tolerance
+# is supplied by the caller or the run reports MEASURED_NOT_SCORED and exits 2, because a
+# measurement no gate consumed must not exit 0.
+# ------------------------------------------------------------------------------------------
+ARM_REFERENCE_MEMBER = "sdpa_fused"       # the fused GPU member: REQ-021's comparison, staged
+
+
+def _kernel_identity(fn) -> dict:
+    """Everything observable about the object ``_load_kernel`` returned.
+
+    ``attention_cte`` is a ``GenericKernel`` instance and not a function, so ``__module__`` may
+    live on the instance, on its type, or on a wrapped callable. All of them are recorded and the
+    guard accepts a match on any -- the alternative is a guard that fails on the real kernel for
+    a reason that has nothing to do with which kernel it is.
+    """
+    inner = getattr(fn, "func", None) or getattr(fn, "__wrapped__", None)
+    mods = [m for m in (getattr(fn, "__module__", None), type(fn).__module__,
+                        getattr(inner, "__module__", None)) if isinstance(m, str)]
+    return {"repr": repr(fn)[:200], "type": type(fn).__name__,
+            "modules_observed": sorted(set(mods)),
+            "qualname": getattr(fn, "__qualname__", getattr(fn, "__name__", None)),
+            "inner_qualname": getattr(inner, "__qualname__", None)}
+
+
+def _under_nkilib(ident: dict) -> bool:
+    return any(m == "nkilib" or m.startswith("nkilib.") for m in ident["modules_observed"])
+
+
+def _write_arm(args, body: dict, verdict: str, code: int) -> int:
+    n_fail = sum(1 for r in RESULTS if not r["pass"])
+    with open(args.arm_out, "w") as fh:
+        json.dump({"suite": "C5 attention parity through the REAL Neuron kernel "
+                            "(TASK-N08 owed step 1's arm)",
+                   "arm": "neuron",
+                   "reference_member": ARM_REFERENCE_MEMBER,
+                   "cross_device": True,
+                   "cross_device_note": "unlike c5_reference_floor_results.json, which is "
+                                        "GPU-vs-GPU with two of four members going through "
+                                        "install_cte_stub(), this compares a Neuron kernel "
+                                        "against staged GPU outputs -- the axis that artifact "
+                                        "says it stops one short of",
+                   "harness_revision": _harness_revision(
+                       os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))),
+                   "geometry": {"num_heads": NUM_HEADS, "head_dim": HEAD_DIM,
+                                "max_total_frames": MTF,
+                                "plan": "plan_tiles(1124 + 1) = 1 tile x 1152"},
+                   **body,
+                   "n_checks": len(RESULTS), "n_fail": n_fail, "verdict": verdict,
+                   "results": RESULTS}, fh, indent=2)
+    print(f"\n===== {verdict}: {len(RESULTS) - n_fail}/{len(RESULTS)} guards passed, "
+          f"exit {code}  ->  {args.arm_out}\n")
+    return code
+
+
+def run_neuron_arm(args) -> int:
+    """TASK-N08 owed step 1. Returns the exit code documented in the module docstring."""
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n=== C5 attention parity, NEURON arm (device={device}, H={NUM_HEADS}, "
+          f"D={HEAD_DIM}, mtf={MTF}) ===\n")
+
+    # ---- provenance, scored first ---------------------------------------------------------
+    emit("stub_was_never_installed_in_this_process", not STUB_INSTALLS,
+         stub_installs=STUB_INSTALLS,
+         witness="module-level STUB_INSTALLS, appended by install_cte_stub itself at every call",
+         detail="REQ-086 makes invoking nkilib.core.attention.attention_cte the definition of "
+                "real hardware for REQ-028, so a run reporting the stub's numbers is this arm's "
+                "own vacuity failure and not a pass. The stub agrees with the GPU reference to "
+                "~1e-6, which is why this cannot be left to inspection of the output")
+    live = _kernel_identity(NeuronAttentionAdapter._load_kernel)
+    pristine = NeuronAttentionAdapter._load_kernel is _PRISTINE_LOAD_KERNEL
+    emit("load_kernel_is_still_the_shipped_method", pristine,
+         observed=live, expected=_kernel_identity(_PRISTINE_LOAD_KERNEL),
+         detail="identity against the method captured at import, before this process could "
+                "patch it. install_cte_stub assigns a lambda whose qualname is "
+                "install_cte_stub.<locals>.<lambda>; an equality-on-name test would also accept "
+                "a same-named replacement, and identity does not")
+    if not pristine or STUB_INSTALLS:
+        return _write_arm(args, {"kernel": None, "raises_rather_than_falling_back": None,
+                                 "not_scored_because": "kernel provenance failed; no rel_err "
+                                                       "was computed, because a discrepancy "
+                                                       "from an unknown kernel misleads rather "
+                                                       "than under-informs"},
+                          "FAIL", 1)
+
+    # ---- the venue: env first, and an env block is NOT the fallback property --------------
+    try:
+        NeuronAttentionAdapter._assert_env()                       # noqa: SLF001
+        env_why = None
+    except RuntimeError as exc:
+        env_why = str(exc)[:400]
+    env = {"PJRT_DEVICE": os.environ.get("PJRT_DEVICE"),
+           "NEURON_PLATFORM_TARGET_OVERRIDE": os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE"),
+           "assert_env_raised": env_why}
+    if env_why:
+        print(f"  BLOCKED: {env_why}")
+        return _write_arm(args, {"device": device, "env": env, "kernel": None,
+                                 "blocked_because": "neuron_env_not_configured",
+                                 "raises_rather_than_falling_back": None,
+                                 "raises_note": "null on purpose. This run never reached the "
+                                                "nkilib import, so it demonstrates nothing "
+                                                "about what happens when the kernel is absent "
+                                                "-- exporting both variables is what makes that "
+                                                "question reachable, at the desk included"},
+                          "BLOCKED", 3)
+
+    # ---- the real import. No stub, no patch: whatever _load_kernel does is the answer -----
+    cache, adapter = build_with_adapter(HEAD_DIM, NUM_HEADS, MTF, device, check_env=True)
+    emit("adapter_instance_does_not_shadow_load_kernel", "_load_kernel" not in vars(adapter),
+         instance_attributes=sorted(vars(adapter)),
+         detail="the class-level guard above cannot see a per-instance assignment, and "
+                "adapter._load_kernel = ... would bypass it silently")
+    try:
+        kernel, load_exc = adapter._load_kernel(), None            # noqa: SLF001
+    except Exception as exc:                                       # noqa: BLE001
+        kernel, load_exc = None, {"type": type(exc).__name__, "message": str(exc)[:400],
+                                  "cause": type(exc.__cause__).__name__ if exc.__cause__
+                                  else None}
+    if kernel is None:
+        emit("absent_kernel_raises_rather_than_falling_back", True, raised=load_exc,
+             detail="the property this arm exists to have. _load_kernel raised instead of "
+                    "returning a substitute, so no run can reach compute_attention on a host "
+                    "without the Neuron stack -- a silent fallback is how the stub got into "
+                    "every existing figure. Desk-verifiable, since the desk GPU is exactly such "
+                    "a host once the two env vars above are exported")
+        return _write_arm(args, {"device": device, "env": env, "kernel": None,
+                                 "blocked_because": "neuron_kernel_unavailable",
+                                 "raises_rather_than_falling_back": True},
+                          "BLOCKED", 3)
+
+    ident = _kernel_identity(kernel)
+    emit("kernel_is_the_real_nkilib_attention_cte", _under_nkilib(ident), kernel=ident,
+         required="a module under nkilib",
+         detail="scored before any rel_err. REQ-086's definition of real hardware is which "
+                "kernel ran, so this is the gate that makes the discrepancy below mean anything")
+    if not _under_nkilib(ident):
+        return _write_arm(args, {"device": device, "env": env, "kernel": ident,
+                                 "raises_rather_than_falling_back": False,
+                                 "not_scored_because": "_load_kernel returned an object that is "
+                                                       "not under nkilib; no rel_err computed"},
+                          "FAIL", 1)
+
+    # ---- the reference. Transport is not trust: verify the bytes before using them ---------
+    manifest, manifest_why = {}, None
+    try:
+        with open(args.reference_manifest) as fh:
+            art = json.load(fh)
+        manifest = {os.path.basename(c["retained_tensors"]["path"]): c
+                    for c in art["cells"] if c.get("retained_tensors")}
+    except Exception as exc:                                       # noqa: BLE001
+        manifest_why = f"{type(exc).__name__}: {exc}"[:200]
+    staged = sorted(f for f in os.listdir(args.reference_tensors) if f.endswith(".pt")) \
+        if args.reference_tensors and os.path.isdir(args.reference_tensors) else []
+    verified, bad = [], []
+    for name in staged:
+        cell = manifest.get(name)
+        got = _sha256(os.path.join(args.reference_tensors, name))
+        if cell and got == cell["retained_tensors"]["sha256"]:
+            verified.append(name)
+        else:
+            bad.append({"file": name, "sha256": got,
+                        "expected": (cell or {}).get("retained_tensors", {}).get("sha256"),
+                        "why": "not in the manifest" if not cell else "sha256 mismatch"})
+    emit("staged_reference_outputs_present_and_verified", bool(verified) and not bad,
+         reference_tensors=args.reference_tensors, manifest=args.reference_manifest,
+         manifest_unreadable_because=manifest_why, files_verified=verified, files_rejected=bad,
+         detail="owed step 2's tensors are the only admissible reference: a CPU SDPA on the "
+                "trn2 host cannot discharge REQ-021's GPU comparison, and reseeding on another "
+                "device attends different keys (replay()'s docstring). Staging moves bytes and "
+                "confers no integrity, so each file is checked against the sha256 committed in "
+                "c5_reference_floor_results.json. A run with nothing to compare against is the "
+                "vacuous case and fails here rather than reporting a verdict on nothing")
+    if not verified or bad:
+        return _write_arm(args, {"device": device, "env": env, "kernel": ident,
+                                 "raises_rather_than_falling_back": False,
+                                 "not_scored_because": "no verified staged reference"},
+                          "FAIL", 1)
+
+    # ---- and only now, the comparison -----------------------------------------------------
+    cells, worst, worst_at, dtypes = [], 0.0, None, set()
+    for name in verified:
+        blob = torch.load(os.path.join(args.reference_tensors, name), weights_only=False)
+        ref = blob["outputs"].get(ARM_REFERENCE_MEMBER)
+        row = {"file": name, "frames": blob["frames"], "seqlen_q": blob["seqlen_q"],
+               "reference_device": blob["device"], "dtype": blob["dtype"],
+               "geometry_matches": (blob["num_heads"] == NUM_HEADS
+                                    and blob["head_dim"] == HEAD_DIM
+                                    and blob["max_total_frames"] == MTF)}
+        dtypes.add(blob["dtype"])
+        try:
+            if ref is None:
+                raise RuntimeError(f"staged blob has no {ARM_REFERENCE_MEMBER} output")
+            if not row["geometry_matches"]:
+                raise RuntimeError("staged blob was produced at another geometry")
+            # No dtype argument anywhere: the arm runs at the dtype the reference was staged
+            # at. Casting here would compare a bf16 evaluation against an fp32 reference and
+            # score it against an fp32-measured floor, which is the substitution the 2026-08-08
+            # review's P1 caught in the other direction. A bf16 answer needs a bf16 reference.
+            q = blob["inputs"]["q"].to(device)
+            k_live = blob["inputs"]["k_live"].to(device)
+            v_live = blob["inputs"]["v_live"].to(device)
+            c5, _ = build_with_adapter(HEAD_DIM, NUM_HEADS, MTF, device, check_env=True)
+            replay(c5, k_live, v_live, NUM_HEADS, HEAD_DIM)
+            k_seen, v_seen, valid, _ = c5.visible_group(0, 0)
+            n = int(valid)
+            row["replay_is_bit_exact"] = bool(
+                n == int(k_live.shape[0])
+                and torch.equal(k_seen[:n].cpu(), k_live.cpu())
+                and torch.equal(v_seen[:n].cpu(), v_live.cpu()))
+            got = c5.compute_attention(0, 0, q)
+            # Compared on the host in fp32 so a second device's arithmetic cannot enter the
+            # comparison itself.
+            row["rel_err"] = rel_err(got.detach().cpu().float(), ref.float())
+            row["bit_equal"] = torch.equal(got.detach().cpu().float(), ref.float())
+            row["also_vs_adapter_einsum"] = (
+                rel_err(got.detach().cpu().float(), blob["outputs"]["adapter_einsum"].float())
+                if "adapter_einsum" in blob["outputs"] else None)
+        except Exception as exc:                                   # noqa: BLE001 - a cell that
+            row["failed"] = f"{type(exc).__name__}: {exc}"[:300]   # cannot run is data
+        if row.get("rel_err") is not None and row["rel_err"] > worst:
+            worst, worst_at = row["rel_err"], {"frames": row["frames"],
+                                               "seqlen_q": row["seqlen_q"], "file": name}
+        cells.append(row)
+        print(f"    {name}: frames={row['frames']:5d} sq={row['seqlen_q']} "
+              + (f"rel_err={row['rel_err']:.3e} replay_exact={row.get('replay_is_bit_exact')}"
+                 if "rel_err" in row else f"FAILED {row.get('failed')}"))
+
+    scored = [c for c in cells if c.get("rel_err") is not None]
+    emit("every_staged_cell_ran_and_replayed_bit_exactly",
+         bool(scored) and len(scored) == len(cells)
+         and all(c.get("replay_is_bit_exact") for c in scored),
+         cells_scored=f"{len(scored)}/{len(cells)}",
+         cells_failed=[{"file": c["file"], "failed": c["failed"]} for c in cells
+                       if "failed" in c],
+         replay_exact=[c.get("replay_is_bit_exact") for c in cells],
+         detail="append is a copy, so a replayed prefix that is not bit-equal to the staged "
+                "keys means this run attended something the reference never saw, and the "
+                "rel_err below would be a comparison of two different problems")
+
+    # Coverage is recorded, not gated by default: TASK-N10's shallow-first rule means a first
+    # trn2 run legitimately carries one cell. --require-full-geometry is what the final Phase 4
+    # run passes, so a partial run can never be cited as the whole geometry either way.
+    expected = len(manifest) or len(staged)
+    full = len(scored) == expected and expected > 0
+    if args.require_full_geometry:
+        emit("arm_geometry_fully_covered", full, cells_scored=len(scored), expected=expected,
+             detail="requested explicitly. The Phase 4 run that discharges REQ-028 needs every "
+                    "staged cell; a shallow-first probe does not and must not claim to")
+
+    tol = args.tolerance
+    if tol is not None:
+        emit("neuron_vs_staged_gpu_reference_within_tolerance", bool(scored) and worst <= tol,
+             worst_rel_err=f"{worst:.3e}", tolerance=tol, worst_at=worst_at,
+             detail="the bar is the caller's, computed by TASK-N21 as "
+                    "max(reference_floor, 3 x noise_floor). Nothing here derives it: the "
+                    "harness's own TOL=1e-4 above is a generous parity tolerance and not a "
+                    "floor. A discrepancy above the bar escalates per TASK-N21's step-5 rule "
+                    "and is never used to move the floor -- the value being scored cannot "
+                    "re-derive the bar that scores it")
+
+    body = {"device": device, "env": env, "kernel": ident,
+            "raises_rather_than_falling_back": False,
+            "raises_note": "false because the kernel WAS available here, so the property was "
+                           "not exercised by this run; it is recorded true by the runs that "
+                           "block with neuron_kernel_unavailable",
+            "reference_tensors": args.reference_tensors,
+            "reference_manifest": args.reference_manifest,
+            "input_dtypes": sorted(dtypes),
+            "cells_expected": expected, "cells_scored": len(scored),
+            "full_geometry_covered": full,
+            "tolerance": tol,
+            "worst_rel_err": (worst if scored else None), "worst_rel_err_at": worst_at,
+            "cells": cells}
+    n_fail = sum(1 for r in RESULTS if not r["pass"])
+    if n_fail:
+        verdict, code = "FAIL", 1
+    elif tol is None:
+        body["not_scored_because"] = ("no --tolerance was supplied, so this run measured a "
+                                      "discrepancy that no gate consumed. Exit 2, never 0")
+        verdict, code = "MEASURED_NOT_SCORED", 2
+    else:
+        verdict, code = "MEASURED", 0
+    if scored:
+        print(f"\n    worst Neuron-vs-staged-GPU rel_err = {worst:.6e}  at {worst_at}")
+    return _write_arm(args, body, verdict, code)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--inject", choices=INJECTIONS, default=None)
@@ -598,12 +992,46 @@ def main() -> int:
     ap.add_argument("--allow-cpu", action="store_true",
                     help="permit the floor measurement without a GPU, stamping the artifact "
                          "not_reportable")
+    ap.add_argument("--arm", choices=("stub", "neuron"), default="stub",
+                    help="which kernel the run goes through. 'stub' is every existing "
+                         "invocation and is unchanged; 'neuron' is TASK-N08 owed step 1's arm, "
+                         "which leaves _load_kernel alone and lets the real nkilib import "
+                         "happen (REQ-086's definition of real hardware for REQ-028)")
+    ap.add_argument("--arm-out", default=os.path.join(os.path.dirname(__file__),
+                                                     "c5_neuron_arm_results.json"))
+    ap.add_argument("--reference-tensors", default=None,
+                    help="the staged owed-step-2 directory the Neuron arm compares against; "
+                         "its files are verified against --reference-manifest before use")
+    ap.add_argument("--reference-manifest",
+                    default=os.path.join(os.path.dirname(__file__),
+                                         "c5_reference_floor_results.json"),
+                    help="the committed floor artifact, whose cells[].retained_tensors.sha256 "
+                         "is the manifest for the staged tensors")
+    ap.add_argument("--tolerance", type=float, default=None,
+                    help="the bar the Neuron arm scores against, supplied by the caller: "
+                         "TASK-N21 computes max(reference_floor, 3 x noise_floor). Omit it and "
+                         "the arm reports MEASURED_NOT_SCORED with exit 2 -- there is "
+                         "deliberately no default, because this harness's own generous "
+                         "TOL=1e-4 is not a derived floor")
+    ap.add_argument("--require-full-geometry", action="store_true",
+                    help="make full staged-cell coverage a guard rather than a recorded field; "
+                         "the Phase 4 run that discharges REQ-028 passes this, a shallow-first "
+                         "probe under TASK-N10's rule does not")
+    ap.add_argument("--device", default=None,
+                    help="device for the Neuron arm. Which string names a Trainium device is "
+                         "not established by any run in this repository, so it is a parameter "
+                         "here rather than a guess in the source; defaults to cuda if visible, "
+                         "else cpu, which is what the desk raise-not-fallback check wants")
     args = ap.parse_args()
 
     # Owed step 3 is a measurement, not a check. It writes its own artifact and deliberately
-    # does not join the 7/7 parity verdict other documents cite by count.
+    # does not join the 7/7 parity verdict other documents cite by count. The same is true of
+    # the Neuron arm, and for the same reason -- plus one of its own: it must not run any code
+    # path that has touched install_cte_stub(), so it dispatches before the stub install below.
     if args.measure_reference_floor:
         return measure_reference_floor(args)
+    if args.arm == "neuron":
+        return run_neuron_arm(args)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     install_cte_stub(honour_prior_used_len=bool(args.honour_prior_used_len))
