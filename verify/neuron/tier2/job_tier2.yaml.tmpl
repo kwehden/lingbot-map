@@ -1,0 +1,309 @@
+# =====================================================================================
+# The version-controlled trn2 verification job (spec/neuron-port/tasks.md TASK-N18).
+#
+# THIS IS A TEMPLATE. Do not hand it to `sky launch`. `launch_tier2.py` substitutes every
+# doubled-at-sign token, base64-encodes every embedded script, and validates the rendered
+# result against the nine operational constraints before emitting anything launchable. A
+# hand-launched template renders its tokens literally, and the resulting failure looks
+# like a capacity failure rather than an operator error -- which is how two of those nine
+# constraints were learned in the first place. (No literal token form appears in these
+# comments: the runner refuses to emit a job with an unsubstituted token left in it, and
+# a token quoted in prose would trip that check on every render.)
+#
+# NOTHING SITE-SPECIFIC IS COMMITTED HERE. Every account-, VPC-, bucket- and
+# instance-shaped value arrives as a token from --site-config, because this repository
+# has public remotes. See site_config.example.json.
+#
+# The stage set is data, not structure: every stage this job can run is written out
+# below, and LINGBOT_T2_STAGES (set from the runner's profile) selects which ones
+# execute. A stage that is not selected still records itself and still flushes, so the
+# "one flush per stage" constraint is checkable by counting lines in this file rather
+# than by trusting a code path to have been taken.
+# =====================================================================================
+name: @@RUN_NAME@@
+
+resources:
+  cloud: aws
+  instance_type: @@INSTANCE_TYPE@@
+  disk_size: @@DISK_SIZE@@
+@@RESOURCES_EXTRA@@
+  # Zone order is an input, not a fact about the world. It is rendered from
+  # --site-config's `zones` list: SkyPilot's catalog prices some trn2 sizes in exactly
+  # one zone, and the zone that works is a property of the account, not of this file.
+  any_of:
+@@ANY_OF@@
+
+envs:
+  LINGBOT_T2_S3_BUCKET: "@@S3_BUCKET@@"
+  LINGBOT_T2_S3_PREFIX: "@@S3_PREFIX@@"
+  LINGBOT_T2_RUN_ID: "@@RUN_ID@@"
+  LINGBOT_T2_PROFILE: "@@PROFILE@@"
+  LINGBOT_T2_STAGES: "@@STAGES@@"
+  # What the launcher ASKED for. The category actually reached is derived on the
+  # instance from IMDS in the identity stage and recorded separately -- REQ-090 scores
+  # the second, and a request is not a result.
+  LINGBOT_T2_CATEGORY_REQUESTED: "@@CATEGORY@@"
+  LINGBOT_T2_REPO_URL: "@@REPO_URL@@"
+  LINGBOT_T2_REPO_REF: "@@REPO_REF@@"
+  # The exact commit the launcher verified was published (TASK-N18 constraint 4). The
+  # repo stage re-checks it after cloning: the launcher's check can go stale between
+  # validation and the instance coming up.
+  LINGBOT_T2_REPO_HEAD: "@@REPO_HEAD@@"
+  # owed step 2's staged reference tensors (s3:// URI), or empty for profiles that
+  # compare nothing.
+  LINGBOT_T2_REFERENCE_URI: "@@REFERENCE_URI@@"
+  LINGBOT_T2_VENV_PREFERENCE: "@@VENV_PREFERENCE@@"
+  # Empty unless --c5-tolerance was passed. There is no default and there must not be
+  # one: the arm exits 2 MEASURED_NOT_SCORED without a tolerance, and 2 is not a pass.
+  LINGBOT_T2_C5_TOLERANCE: "@@C5_TOLERANCE@@"
+  LINGBOT_T2_C5_REQUIRE_FULL: "@@C5_REQUIRE_FULL@@"
+
+setup: |
+  # Minimal by design. The Neuron DLAMI ships the SDK, driver and venvs; installing
+  # anything risks a long pip resolve on a paid spot instance. This job DISCOVERS its
+  # environment at runtime and records what it found (REQ-088).
+  set -x
+  which aws || pip install --quiet awscli || echo "WARN: no aws cli; S3 flush will fail"
+
+run: |
+  # Deliberately NOT `set -e`: each stage answers part of the question independently, and
+  # on a one-shot spot instance a partial answer beats an early exit. REQ-092 makes this
+  # load-bearing -- a run that dies mid-stage must still have flushed what it knew.
+  set -u
+  export PATH="/opt/aws/neuron/bin:$PATH"
+  START_TS=$(date +%s)
+  OUT="${OUTPUT_DIR:-/tmp/output}"; mkdir -p "$OUT" /tmp/t2
+  JSON="$OUT/tier2_result.json"; LOG="$OUT/tier2_result.log"
+  S3="s3://${LINGBOT_T2_S3_BUCKET}/${LINGBOT_T2_S3_PREFIX}/${LINGBOT_T2_RUN_ID}"
+  : > "$LOG"
+  say() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
+
+  # ---- embedded scripts ------------------------------------------------------------
+  # Base64, not heredocs (TASK-N18 constraint 1). Every one of these travels through an
+  # SSM AWS-RunShellScript document and then through YAML block scalars; a heredoc
+  # survives neither reliably, and the readable originals live in tier2/stages/*.
+  echo @@B64:stages/rec.py@@ | base64 -d > /tmp/t2/rec.py
+  echo @@B64:stages/identity.py@@ | base64 -d > /tmp/t2/identity.py
+  echo @@B64:stages/sdk_versions.py@@ | base64 -d > /tmp/t2/sdk_versions.py
+  echo @@B64:stages/verify_reference.py@@ | base64 -d > /tmp/t2/verify_reference.py
+  echo @@B64:stages/verdict.py@@ | base64 -d > /tmp/t2/verdict.py
+  echo @@B64:stages/get.py@@ | base64 -d > /tmp/t2/get.py
+  echo @@B64:stages/spot_watch.sh@@ | base64 -d > /tmp/t2/spot_watch.sh
+  chmod +x /tmp/t2/spot_watch.sh
+
+  rec() { python3 /tmp/t2/rec.py "$JSON" "$1" "$2" 2>/dev/null || true; }
+  flush() {
+    rec "_elapsed_s" "$(( $(date +%s) - START_TS ))"
+    rec "_last_stage_flushed" "$1"
+    aws s3 cp "$JSON" "$S3/tier2_result.json" --only-show-errors 2>/dev/null \
+      && say "flushed -> S3 (after: $1)" || say "WARN: S3 flush FAILED (after: $1)"
+    aws s3 cp "$LOG" "$S3/tier2_result.log" --only-show-errors 2>/dev/null || true
+  }
+
+  STAGES=",${LINGBOT_T2_STAGES},"
+  stage() {
+    case "$STAGES" in
+      *",$1,"*) say "--- stage $1"; return 0 ;;
+    esac
+    say "--- stage $1: SKIPPED (not in profile ${LINGBOT_T2_PROFILE})"
+    rec "stages.$1.status" "SKIPPED_NOT_IN_PROFILE"
+    return 1
+  }
+
+  # ---- the preemption watcher (constraints 2 and 3, REQ-092) -----------------------
+  # `setsid nohup ... < /dev/null` because a watcher started any other way dies with the
+  # SSM session that spawned it, and a watcher that dies records no preemption -- which
+  # is exactly the case REQ-092 exists for. Its long sleep is INSIDE the detached
+  # script, never in a foreground command: an SSM document that blocks past its own
+  # timeout is killed with its stage half-done.
+  setsid nohup /tmp/t2/spot_watch.sh "$JSON" "$S3" "$LOG" "$START_TS" \
+    > /tmp/t2/spot_watch.out 2>&1 < /dev/null &
+  WATCH_PID=$!
+  say "spot watcher detached, pid $WATCH_PID"
+  rec "_watcher_pid" "$WATCH_PID"
+
+  say "=== Tier 2 job start: profile=${LINGBOT_T2_PROFILE} run=${LINGBOT_T2_RUN_ID} ==="
+  rec "job_template_version" "tier2-2026-08-14"
+  rec "profile" "$LINGBOT_T2_PROFILE"
+  rec "stages_selected" "$LINGBOT_T2_STAGES"
+  rec "category_requested" "$LINGBOT_T2_CATEGORY_REQUESTED"
+  rec "repo_head_expected" "$LINGBOT_T2_REPO_HEAD"
+
+  # ---- stage: identity -------------------------------------------------------------
+  # The only writer of the capacity-evidence block. REQ-087 accepts nothing else as
+  # proof that an instance was obtainable -- not a dry-run, not a quota, not an
+  # offerings entry -- so the launcher cannot write these keys and does not try.
+  if stage identity; then
+    timeout 120 python3 /tmp/t2/identity.py "$JSON" || say "WARN: identity stage failed"
+  fi
+  flush identity
+
+  # ---- stage: devices --------------------------------------------------------------
+  if stage devices; then
+    ( timeout 120 neuron-ls 2>&1 || echo "neuron-ls unavailable" ) | tee -a "$LOG" \
+      > /tmp/t2/neuron_ls.txt
+    rec "stages.devices.neuron_ls" "$(tr '\n' ' ' < /tmp/t2/neuron_ls.txt | cut -c1-2000)"
+    rec "stages.devices.device_nodes" "$(ls /dev/neuron* 2>/dev/null | tr '\n' ' ')"
+    rec "stages.devices.status" "RECORDED"
+  fi
+  flush devices
+
+  # ---- stage: venv -----------------------------------------------------------------
+  # Activate with `. <venv>/bin/activate`; never invoke the venv's interpreter directly
+  # (constraint 5). Doing that leaves the PJRT plugin path unset, the device count reads
+  # zero, and the run looks like a hardware finding. That broke Phase 0 run 1. The form
+  # this forbids is not spelled out here for the reason given in the header: the runner
+  # greps the whole rendered job for it, prose included.
+  VENV=""
+  if stage venv; then
+    VENVS=$(ls -d /opt/aws_neuron_venv* /opt/aws/neuron/venv* ~/aws_neuron_venv* 2>/dev/null)
+    for v in $VENVS; do
+      case "$v" in *"${LINGBOT_T2_VENV_PREFERENCE}"*) [ -f "$v/bin/activate" ] && VENV="$v" ;; esac
+    done
+    [ -z "$VENV" ] && for v in $VENVS; do [ -f "$v/bin/activate" ] && VENV="$v" && break; done
+    if [ -n "$VENV" ]; then
+      set +u; . "$VENV/bin/activate"; set -u
+      rec "stages.venv.activated" "$VENV"
+      rec "stages.venv.matched_preference" \
+        "$(case "$VENV" in *"${LINGBOT_T2_VENV_PREFERENCE}"*) echo true ;; *) echo false ;; esac)"
+      rec "stages.venv.status" "ACTIVATED"
+    else
+      # Recorded as a finding, not silently tolerated: the two prior imports that left
+      # REQ-095 open were each taken in whichever venv happened to be active.
+      rec "stages.venv.activated" "null"
+      rec "stages.venv.status" "NO_VENV_FOUND_USING_SYSTEM_PYTHON3"
+    fi
+    # Both, always (constraint 6). One without the other and the kernel cannot identify
+    # a platform; PJRT_DEVICE alone is why the first neuron_probe.json recorded no
+    # devices on a 16-device host.
+    export PJRT_DEVICE=NEURON
+    export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+    rec "stages.venv.pjrt_device" "$PJRT_DEVICE"
+    rec "stages.venv.platform_target_override" "$NEURON_PLATFORM_TARGET_OVERRIDE"
+  fi
+  flush venv
+
+  # ---- stage: sdk_versions ---------------------------------------------------------
+  # REQ-088: pin and record. A tolerance derived under one pinned set is not valid under
+  # another, and NKI-1559 is the reason -- a compiler regression put NaN inside
+  # attention_cte across five model families.
+  if stage sdk_versions; then
+    export PJRT_DEVICE=NEURON
+    export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+    timeout 300 python3 /tmp/t2/sdk_versions.py "$JSON" || say "WARN: version capture failed"
+  fi
+  flush sdk_versions
+
+  # ---- stage: noop -----------------------------------------------------------------
+  # TASK-N18's own verification. Proves the whole path -- launch, usable state, artifact,
+  # S3, teardown -- and nothing else. It computes no numbers on purpose: a stage that
+  # produced a figure would tempt someone to cite it.
+  if stage noop; then
+    rec "stages.noop.status" "OK"
+    rec "stages.noop.detail" "no-op stage reached a usable state and wrote its artifact"
+    rec "stages.noop.uptime_s" "$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo unknown)"
+  fi
+  flush noop
+
+  # ---- stage: repo -----------------------------------------------------------------
+  # Constraint 4's in-job half. The launcher checked `git ls-remote` against local HEAD
+  # before rendering; between then and here an instance had to be acquired, so the
+  # cloned tree is checked again against the sha that was validated. A mismatch is a
+  # refusal, not a warning: an unknown revision produced every artifact downstream.
+  if stage repo; then
+    if [ -z "$LINGBOT_T2_REPO_URL" ] || [ -z "$LINGBOT_T2_REPO_REF" ]; then
+      rec "stages.repo.status" "FAIL_NO_REPO_CONFIGURED"
+    else
+      rm -rf /tmp/t2/repo
+      if timeout 300 git clone --quiet --branch "$LINGBOT_T2_REPO_REF" \
+           "$LINGBOT_T2_REPO_URL" /tmp/t2/repo; then
+        GOT=$(git -C /tmp/t2/repo rev-parse HEAD)
+        rec "stages.repo.cloned_head" "$GOT"
+        if [ "$GOT" = "$LINGBOT_T2_REPO_HEAD" ]; then
+          rec "stages.repo.status" "OK"
+        else
+          rec "stages.repo.status" "FAIL_HEAD_MISMATCH"
+          rec "stages.repo.detail" "expected $LINGBOT_T2_REPO_HEAD, cloned $GOT"
+        fi
+      else
+        rec "stages.repo.status" "FAIL_CLONE"
+      fi
+    fi
+  fi
+  flush repo
+
+  # ---- stage: reference ------------------------------------------------------------
+  # owed step 2's staged tensors. Transport moves bytes and confers no integrity, so
+  # every file is checked against the sha256 committed in c5_reference_floor_results.json
+  # before anything reads it. A CPU SDPA on this host cannot substitute: it would not
+  # discharge REQ-021's GPU comparison, and reseeding on another device attends
+  # different keys.
+  if stage reference; then
+    if [ -z "$LINGBOT_T2_REFERENCE_URI" ]; then
+      rec "stages.reference.status" "FAIL_NO_REFERENCE_URI"
+    else
+      mkdir -p /tmp/t2/reference
+      if timeout 600 aws s3 sync "$LINGBOT_T2_REFERENCE_URI" /tmp/t2/reference \
+           --only-show-errors; then
+        timeout 300 python3 /tmp/t2/verify_reference.py "$JSON" /tmp/t2/reference \
+          /tmp/t2/repo/verify/neuron/c5_reference_floor_results.json \
+          || say "WARN: reference verification FAILED -- no comparison will be scored"
+      else
+        rec "stages.reference.status" "FAIL_S3_SYNC"
+      fi
+    fi
+  fi
+  flush reference
+
+  # ---- stage: c5_arm ---------------------------------------------------------------
+  # Runs the arm TASK-N08 owed step 1 authored. It refuses to fall back to the stub and
+  # refuses to score without a verified reference, so this stage passes it the staged
+  # directory and a tolerance and lets the arm's own guards decide. --tolerance has no
+  # default anywhere: an unscored measurement exits 2, which is not a pass.
+  if stage c5_arm; then
+    export PJRT_DEVICE=NEURON
+    export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+    REFOK=$(python3 /tmp/t2/get.py "$JSON" stages.reference.status 2>/dev/null || echo "")
+    if [ "$REFOK" != "OK" ]; then
+      rec "stages.c5_arm.status" "SKIPPED_REFERENCE_NOT_VERIFIED"
+    elif [ -z "${LINGBOT_T2_C5_TOLERANCE:-}" ]; then
+      rec "stages.c5_arm.status" "FAIL_NO_TOLERANCE_SUPPLIED"
+    else
+      cd /tmp/t2/repo
+      timeout 3000 python3 verify/neuron/check_c5_attention_parity.py \
+        --arm neuron \
+        --reference-tensors /tmp/t2/reference \
+        --reference-manifest verify/neuron/c5_reference_floor_results.json \
+        --tolerance "$LINGBOT_T2_C5_TOLERANCE" \
+        --arm-out /tmp/t2/c5_arm.json ${LINGBOT_T2_C5_REQUIRE_FULL:+--require-full-geometry} \
+        2>&1 | tee -a "$LOG"
+      ARMRC=${PIPESTATUS[0]}
+      cd - > /dev/null
+      rec "stages.c5_arm.exit_code" "$ARMRC"
+      rec "stages.c5_arm.artifact" "$(cat /tmp/t2/c5_arm.json 2>/dev/null || echo '{}')"
+      aws s3 cp /tmp/t2/c5_arm.json "$S3/c5_arm.json" --only-show-errors 2>/dev/null || true
+      # A compile that ran out of time is not a kernel failure (NKI-1590).
+      if [ "$ARMRC" = "124" ]; then
+        rec "stages.c5_arm.status" "INCONCLUSIVE_COMPILE_TIMEOUT"
+      elif [ "$ARMRC" = "0" ]; then
+        rec "stages.c5_arm.status" "OK"
+      else
+        rec "stages.c5_arm.status" "FAIL_EXIT_${ARMRC}"
+      fi
+    fi
+  fi
+  flush c5_arm
+
+  # ---- stage: complete -------------------------------------------------------------
+  # The ONLY writer of terminal_state. Everything downstream -- and `launch_tier2.py
+  # --collect` in particular -- reads its absence as "this run was interrupted", never
+  # as a failure (REQ-092). A run that is killed cannot lie about having finished
+  # because it never reaches this line.
+  if stage complete; then
+    kill "$WATCH_PID" 2>/dev/null || true
+    timeout 120 python3 /tmp/t2/verdict.py "$JSON"
+    VERDICT_RC=$?
+    say "verdict written, rc=$VERDICT_RC"
+  fi
+  flush complete
+  say "=== Tier 2 job end ==="

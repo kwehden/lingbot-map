@@ -1,0 +1,77 @@
+{
+  "_README": [
+    "Copy this file somewhere OUTSIDE this repository, fill it in, and pass it with",
+    "--site-config. Do not fill it in here: this repository has public remotes, and every value",
+    "below is an account-, VPC-, bucket- or instance-shaped identifier.",
+    "",
+    "launch_tier2.py validates each value by SHAPE and never against an expected value -- a",
+    "validator that knows the right subnet id has the subnet id in it. It also refuses any value",
+    "still containing REPLACE, EXAMPLE or an angle bracket, so a half-filled copy fails at the",
+    "launcher instead of on a paid instance.",
+    "",
+    "Keys marked (required) are needed for every render. The rest are needed by the profiles or",
+    "checks that use them, and the launcher names the missing one when it needs it."
+  ],
+
+  "s3_bucket": "REPLACE-with-your-results-bucket",
+  "s3_prefix": "REPLACE/with/a/prefix/for/tier2/runs",
+  "region": "REPLACE-with-region",
+  "zones": ["REPLACE-with-az", "REPLACE-with-second-choice-az"],
+
+  "_zones_note": [
+    "Ordered, most-likely first, and rendered into the job's resources.any_of. This is an INPUT,",
+    "not a fact about the world: SkyPilot's catalog prices some trn2 sizes in exactly one zone,",
+    "and which zone has capacity is a property of the account. A run may come back on the second",
+    "entry -- which is why the category is derived from IMDS on the instance rather than from",
+    "what was requested here (REQ-090)."
+  ],
+
+  "subnet_id": "subnet-REPLACE",
+  "vpc_name": "REPLACE-with-vpc-name",
+  "_subnet_note": [
+    "Recorded and shape-validated, NOT rendered into the job. SkyPilot is not installed on the",
+    "desk; it runs on the controller instance, and the subnet it places instances in comes from",
+    "the controller's own ~/.sky/config.yaml rather than from a task YAML field. So these two",
+    "keys document the venue the run is expected to land in and let the launcher record it in the",
+    "manifest; making them take effect is a controller-side change. This is the one part of the",
+    "job that cannot be verified without a launch."
+  ],
+
+  "controller_instance_id": "i-REPLACE",
+  "_controller_note": [
+    "The SkyPilot controller, reached over SSM. Required only for --launch: without it the",
+    "launcher renders and prints the SSM command bodies for someone to run themselves."
+  ],
+
+  "repo_url": "https://github.com/REPLACE/REPLACE.git",
+  "_repo_url_note": [
+    "The remote the instance clones, and the remote `git ls-remote` is run against for TASK-N18",
+    "constraint 4. Required for any launch: without it there is no way to check that the instance",
+    "would clone this desk's HEAD."
+  ],
+
+  "image_id": "ami-REPLACE",
+  "_image_id_note": [
+    "Optional. Pinning the DLAMI is the cleanest way to satisfy REQ-088's fourth item; left",
+    "unset, the pin depends on the AMI id the instance reports, which sdk_versions.py records",
+    "either way. A tolerance derived under one pinned set is not valid under another."
+  ],
+
+  "reference_uri": "s3://REPLACE-bucket/REPLACE/prefix/c5_reference_tensors",
+  "_reference_uri_note": [
+    "Where TASK-N08 owed step 2's staged GPU reference tensors live. Needed by the c5-parity",
+    "profile only. Every file synced from here is sha256-checked against the manifest committed",
+    "at verify/neuron/c5_reference_floor_results.json before anything reads it as a reference:",
+    "transport moves bytes and confers no integrity."
+  ],
+
+  "venv_preference": "nxd_inference",
+  "_venv_preference_note": [
+    "A substring identifying which of the DLAMI's venvs to activate. Defaults to nxd_inference.",
+    "The venv is ACTIVATED with `. <venv>/bin/activate`, never invoked as <venv>/bin/python --",
+    "the latter leaves the PJRT plugin path unset, the device count reads zero, and the run looks",
+    "like a hardware finding. That broke Phase 0 run 1 (constraint 5). Recording which venv was",
+    "active also matters for REQ-095: the two prior NxD import attempts that left it open were",
+    "each taken in whichever venv happened to be active."
+  ]
+}
