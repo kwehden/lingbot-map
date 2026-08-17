@@ -31,6 +31,12 @@ baseline mode must run against the UNMODIFIED pre-refactor code -- this script i
 lingbot_map/benchmark lazily (inside functions, not at module scope) precisely so it is
 importable and runnable against a pre-refactor checkout too.
 
+`--mode self_test` needs none of that -- no torch, no checkpoint, no fixture, no GPU. It
+exercises the tolerance derivation (_derive_tol, spec/design.md Decision 4 step 2 / step 5)
+against hand-built noise floors, including the legacy abs-only artifact format, and exits
+nonzero if any assertion fails:
+    python verify/run_kv_cache_backend_checks.py --mode self_test --output_dir /tmp/st
+
 Writes a single JSON results file ($OUTPUT_DIR/results.json: per-check pass/fail + noise
 floors in baseline mode, or per-check pass/fail + diffs in compare mode) and raw
 prediction tensors (baseline mode only, via torch.save, so compare mode has something to
@@ -45,12 +51,17 @@ from pathlib import Path
 
 # Per TASK-003's derived defaults (spec/design.md Decision 4): rtol/atol for bf16 paths
 # vs. the tighter force_fp32 path. Compare mode gates at max(default, 3 x measured
-# baseline noise floor) -- the noise floor itself is measured and recorded by this
-# script's own baseline-mode run, immediately below.
+# baseline noise floor), per half -- see _derive_tol. The noise floor itself is measured and
+# recorded by this script's own baseline-mode run, immediately below.
 _DEFAULT_TOL = {
     "bf16": {"rtol": 1e-3, "atol": 1e-5},
     "fp32": {"rtol": 1e-5, "atol": 1e-6},
 }
+
+# The point past which widening rtol stops producing a gate. rtol = 1.0 is "within 100% of
+# the baseline", which no comparison can fail, so a measured relative floor whose 3x reaches
+# it is refused rather than widened from -- see _derive_tol's fourth section.
+_RTOL_WIDENING_CEILING = 1.0
 
 _OUTPUT_KEYS = ["pose_enc", "depth", "depth_conf", "world_points", "world_points_conf"]
 
@@ -481,6 +492,175 @@ def _values_close(va, vb, tol: dict, exact: bool = False) -> dict:
     }
 
 
+def _derive_tol(defaults: dict, floor_entry: dict) -> dict:
+    """Decision 4 step 5's gate -- max(default, 3 x measured noise floor) -- applied to the
+    matching half of the floor per tolerance: `atol` widens from the ABSOLUTE floor, `rtol`
+    from the RELATIVE one.
+
+    `floor_entry` is one configuration's entry out of baseline mode's recorded
+    `noise_floors`: {output_key: {"max_abs_diff": float, "max_rel_diff": float}}. An empty
+    entry (no baseline recorded for that configuration) yields the defaults unchanged.
+
+    Pure -- no torch, no I/O, no globals -- so `--mode self_test` can exercise every branch
+    on CPU without a checkpoint, a fixture or a GPU.
+
+    *** Why this is not one max() over one number. ***
+    Earlier revisions widened `atol` by `3 x max(noise.values())` and left `rtol` pinned at
+    its default, which the tolerance artifact flagged as diverging from Decision 4. The
+    obvious repair -- feed the same max() into `rtol` too -- is a UNIT ERROR: `noise_floors`
+    recorded max_abs_diff only, so for any key with an absolute floor above
+    3.3e-4 that would push the bf16 `rtol` past its own 1e-3 default and LOOSEN the gate,
+    while appearing to follow the spec. atol and rtol are widened from different measured
+    quantities or not at all.
+
+    *** Legacy artifacts: refuse, and say so. ***
+    A baseline written before this change records a bare float per key (the absolute floor;
+    _values_close computed the relative half and noise_floors discarded it, and it is not
+    recoverable after the fact -- only the first of the two back-to-back runs is saved).
+    There is then no relative floor to widen from, so `rtol` stays at the step-4 default and
+    the refusal plus the keys that caused it are recorded in the returned dict, which
+    callers write into results.json. A run against a legacy baseline therefore states which
+    quantity it declined to widen from instead of silently substituting the wrong one.
+
+    ONE legacy case is not a refusal, because the missing half is entailed rather than
+    guessed: an absolute floor of exactly 0.0 means the two back-to-back runs matched
+    element for element, so max|a-b| / |b| is 0.0 as well. That is what all five recorded
+    configurations measured, so the recorded verdict derives as the plain defaults with
+    nothing refused. A legacy entry with a NONZERO absolute floor carries no such
+    entailment, and that is the one that refuses.
+
+    *** A floor is only usable if it is finite, non-negative, and small enough to gate. ***
+    Widening had no upper bound and no finiteness check, and the widened quantity is the
+    thing that decides a pass. `_values_close` excludes only `denom == 0`, not denom close
+    to zero, so a single denormal baseline element yields an enormous `max_rel_diff`; a
+    relative floor of `1e11` derived `rtol = 3e11`, and one of `inf` derived `rtol = inf`,
+    at which `torch.allclose` passes ANY two tensors. The gate would have been recorded as
+    a PASS while being incapable of failing -- and `inf`/`nan` also make results.json
+    non-strict JSON (`Infinity`, `NaN`), which breaks the `jq` roll-ups that read it.
+    Before the relative half existed `rtol` was pinned, so this failure mode is one this
+    change introduced, and the run that first writes a nonzero-floor baseline is exactly
+    the run that would arm it.
+
+    So a floor that is non-finite or negative is not measurement, it is a broken
+    measurement, and it is refused rather than widened from -- as is any relative floor
+    whose 3x widening would reach `_RTOL_WIDENING_CEILING`, a relative tolerance of 1.0,
+    i.e. "within 100% of the baseline", which no comparison can fail. Every refusal holds
+    the half at its step-4 default, which can only make the gate STRICTER: the safe
+    direction is a run that fails and is looked at, never one that passes on a tolerance
+    nobody chose. `atol` gets the finiteness and sign checks but no ceiling, because its
+    scale is the data's and this file has no scale-free bound to impose on it; what it gets
+    instead is `atol_widening_factor`, so the loosening is visible in the artifact.
+    """
+    abs_floors = []
+    rel_floors = []
+    abs_only_keys = []
+    unusable = []
+
+    def _usable(value, key, half):
+        """A floor we can widen from, or a record of why not. Order matters: the `!=`
+        self-comparison is the nan test, and nan fails every inequality silently."""
+        if value != value or value in (float("inf"), float("-inf")):
+            unusable.append({"key": key, "half": half, "value": repr(value),
+                             "why": "not finite"})
+            return False
+        if value < 0.0:
+            unusable.append({"key": key, "half": half, "value": repr(value),
+                             "why": "negative -- a max of absolute differences cannot be"})
+            return False
+        return True
+
+    for key in sorted(floor_entry):
+        entry = floor_entry[key]
+        if isinstance(entry, dict):
+            abs_floor = entry.get("max_abs_diff")
+            rel_floor = entry.get("max_rel_diff")
+        else:
+            abs_floor, rel_floor = entry, None
+        if abs_floor is not None:
+            abs_floor = float(abs_floor)
+            if _usable(abs_floor, key, "max_abs_diff"):
+                abs_floors.append(abs_floor)
+            else:
+                abs_floor = None          # and so it entails nothing about the other half
+        if rel_floor is None and abs_floor == 0.0:
+            rel_floor = 0.0
+        if rel_floor is not None:
+            rel_floor = float(rel_floor)
+            if _usable(rel_floor, key, "max_rel_diff"):
+                rel_floors.append(rel_floor)
+            else:
+                rel_floor = None
+        if rel_floor is None:
+            abs_only_keys.append(key)
+
+    tol = {
+        "rtol": defaults["rtol"],
+        "atol": defaults["atol"],
+        "abs_floor_max": max(abs_floors) if abs_floors else None,
+        "rel_floor_max": None,
+        "rtol_widened_from_relative_floor": False,
+        "atol_widening_factor": 1.0,
+    }
+    if unusable:
+        tol["unusable_floors"] = unusable
+        tol["unusable_floors_reason"] = (
+            "these recorded floors are not finite non-negative numbers, so they are a "
+            "broken measurement rather than a measured noise floor and nothing is widened "
+            "from them. The half stays at its Decision 4 step-4 default, which can only "
+            "make the gate stricter. Re-measure; a non-finite relative floor usually means "
+            "_values_close divided by a near-zero baseline element."
+        )
+    if abs_floors:
+        tol["atol"] = max(defaults["atol"], 3 * max(abs_floors))
+        tol["atol_widening_factor"] = tol["atol"] / defaults["atol"]
+    if abs_only_keys:
+        tol["rtol_widening_refused"] = True
+        tol["rtol_refusal_keys"] = abs_only_keys
+        tol["rtol_refusal_reason"] = (
+            "baseline noise_floors records an absolute floor only for these keys, so no "
+            "relative floor exists to widen rtol from. rtol held at the Decision 4 step-4 "
+            "default rather than widened by 3 x an absolute difference, which is a unit "
+            "error that would loosen the gate. Re-measure the baseline to widen rtol."
+        )
+    elif rel_floors:
+        tol["rel_floor_max"] = max(rel_floors)
+        widened = 3 * max(rel_floors)
+        if widened >= _RTOL_WIDENING_CEILING:
+            tol["rtol_widening_refused"] = True
+            tol["rtol_refusal_keys"] = [k for k in sorted(floor_entry)
+                                        if _rel_of(floor_entry[k]) == max(rel_floors)]
+            tol["rtol_refusal_reason"] = (
+                "3 x this relative floor is {:g}, at or above a relative tolerance of "
+                "{:g} -- 'within {:g}% of the baseline', which no comparison can fail. A "
+                "measured floor that large is a broken measurement, not a loose gate: "
+                "rtol is held at the step-4 default so the run FAILS and is looked at."
+                .format(widened, _RTOL_WIDENING_CEILING, 100 * _RTOL_WIDENING_CEILING)
+            )
+        else:
+            tol["rtol"] = max(defaults["rtol"], widened)
+            tol["rtol_widened_from_relative_floor"] = tol["rtol"] > defaults["rtol"]
+    return tol
+
+
+def _rel_of(entry):
+    """The relative half of one noise_floors entry, or None for the legacy bare float."""
+    return entry.get("max_rel_diff") if isinstance(entry, dict) else None
+
+
+def _is_strict_json(obj) -> bool:
+    """Whether this would survive into results.json as JSON a strict parser accepts.
+
+    `json.dumps` emits bare `Infinity`/`NaN` by default -- valid Python, not valid JSON -- and
+    the roll-ups over results.json are `jq`. A derived tolerance that cannot be serialised
+    strictly is a defect in the tolerance, so this reports rather than raises.
+    """
+    try:
+        return "Infinity" not in json.dumps(obj, allow_nan=False) \
+            and "NaN" not in json.dumps(obj, allow_nan=False)
+    except (ValueError, TypeError):
+        return False
+
+
 def _tensor_dict_close(a: dict, b: dict, tol: dict, keys=None) -> dict:
     """Per-key parity between two prediction dicts.
 
@@ -549,8 +729,13 @@ def run_baseline(args) -> dict:
         tag = f"{mode}_{'sdpa' if use_sdpa else 'flashinfer'}"
         tol = _DEFAULT_TOL["bf16"]
         diff = _tensor_dict_close(run_a, run_b, tol)
+        # BOTH halves of Decision 4 step 2's floor, per key. Recording only max_abs_diff
+        # (as earlier revisions did) discards the relative floor irrecoverably -- only
+        # run_a is saved, so it cannot be recomputed later -- and leaves compare mode with
+        # nothing dimensionally valid to widen rtol from. See _derive_tol.
         noise_floors[tag] = {
-            k: v["max_abs_diff"] for k, v in diff.items() if "max_abs_diff" in v
+            k: {"max_abs_diff": v["max_abs_diff"], "max_rel_diff": v["max_rel_diff"]}
+            for k, v in diff.items() if "max_abs_diff" in v
         }
         print(f"[run_baseline] noise_floor[{tag}] = {noise_floors[tag]}", flush=True)
         torch.save(run_a, predictions_dir / f"demo_{tag}.pt")
@@ -565,7 +750,8 @@ def run_baseline(args) -> dict:
     run_b = _run_inference(model, "streaming", images, device, force_fp32=True)
     diff = _tensor_dict_close(run_a, run_b, _DEFAULT_TOL["fp32"])
     noise_floors["streaming_flashinfer_fp32"] = {
-        k: v["max_abs_diff"] for k, v in diff.items() if "max_abs_diff" in v
+        k: {"max_abs_diff": v["max_abs_diff"], "max_rel_diff": v["max_rel_diff"]}
+        for k, v in diff.items() if "max_abs_diff" in v
     }
     print("[run_baseline] noise_floor[streaming_flashinfer_fp32] = "
           f"{noise_floors['streaming_flashinfer_fp32']}", flush=True)
@@ -757,17 +943,14 @@ def run_compare(args) -> dict:
         baseline_pred = torch.load(
             baseline_predictions_dir / f"demo_{tag}.pt", weights_only=False)
         noise = baseline_results["checks"]["noise_floors"]["values"].get(tag, {})
-        tol = {
-            "rtol": _DEFAULT_TOL["bf16"]["rtol"],
-            "atol": max(
-                _DEFAULT_TOL["bf16"]["atol"],
-                3 * max(noise.values()) if noise else _DEFAULT_TOL["bf16"]["atol"],
-            ),
-        }
+        tol = _derive_tol(_DEFAULT_TOL["bf16"], noise)
         diff = _tensor_dict_close(baseline_pred, run, tol)
         passed = all(v.get("close", False) for v in diff.values())
         all_pass = all_pass and passed
-        demo_check[tag] = {"pass": passed, "diff": diff}
+        # `tol` carries the derivation's own provenance (which floor widened what, and any
+        # refusal against a legacy abs-only baseline), so the gate this config was scored
+        # at is readable from results.json instead of inferred from the code revision.
+        demo_check[tag] = {"pass": passed, "tol": tol, "diff": diff}
         results["checks"]["demo_parity"] = demo_check
         _flush(f"demo_parity:{tag}")
         del model, run, baseline_pred
@@ -781,18 +964,12 @@ def run_compare(args) -> dict:
         baseline_predictions_dir / "demo_streaming_flashinfer_fp32.pt", weights_only=False)
     noise = baseline_results["checks"]["noise_floors"]["values"].get(
         "streaming_flashinfer_fp32", {})
-    tol = {
-        "rtol": _DEFAULT_TOL["fp32"]["rtol"],
-        "atol": max(
-            _DEFAULT_TOL["fp32"]["atol"],
-            3 * max(noise.values()) if noise else _DEFAULT_TOL["fp32"]["atol"],
-        ),
-    }
+    tol = _derive_tol(_DEFAULT_TOL["fp32"], noise)
     diff = _tensor_dict_close(baseline_pred, run, tol)
     passed = all(v.get("close", False) for v in diff.values())
     all_pass = all_pass and passed
     results["checks"]["demo_parity"]["streaming_flashinfer_fp32"] = {
-        "pass": passed, "diff": diff,
+        "pass": passed, "tol": tol, "diff": diff,
     }
     _flush("demo_parity:streaming_flashinfer_fp32")
     del model, run, baseline_pred
@@ -813,14 +990,7 @@ def run_compare(args) -> dict:
         # config's own measured noise floor -- NOT whatever `tol` the fp32 block above
         # happened to leave bound.
         harness_noise = baseline_results["checks"]["noise_floors"]["values"].get(tag, {})
-        harness_tol = {
-            "rtol": _DEFAULT_TOL["bf16"]["rtol"],
-            "atol": max(
-                _DEFAULT_TOL["bf16"]["atol"],
-                3 * max(harness_noise.values()) if harness_noise
-                else _DEFAULT_TOL["bf16"]["atol"],
-            ),
-        }
+        harness_tol = _derive_tol(_DEFAULT_TOL["bf16"], harness_noise)
         # LingbotMapMethod.process_scene() returns {'frame': {...lists of ndarray...},
         # 'global': {}}. Compare every PREDICTED per-frame key element-wise, at the same
         # tolerance as demo_parity.
@@ -951,12 +1121,218 @@ def run_kv_info_probe(args) -> dict:
     return payload
 
 
+def run_self_test(args) -> dict:
+    """Exercise every branch of _derive_tol on CPU: no torch, no checkpoint, no fixture, no
+    GPU, seconds not minutes.
+
+    The tolerance derivation is the one piece of this harness that decides what counts as a
+    pass, and it is otherwise only ever executed inside a ~40-minute Tier 2 run, where a
+    regression in it would present as a passing gate rather than as an error. These
+    assertions are what make the derivation checkable without spending that run.
+    """
+    # Deliberately a duplicated literal, NOT a reference to _DEFAULT_TOL: this is the gate
+    # compare job 21 was actually scored at, per verify/verification_tolerance_baseline.md's
+    # derived-tolerance table. Pinning it here means an edit to _DEFAULT_TOL fails this test
+    # loudly instead of silently rescoring the one result this refactor is trusted on.
+    recorded_gate = {
+        "bf16": {"rtol": 1e-3, "atol": 1e-5},
+        "fp32": {"rtol": 1e-5, "atol": 1e-6},
+    }
+    checks = []
+
+    def _expect(name: str, ok: bool, detail: dict) -> None:
+        checks.append({"name": name, "pass": bool(ok), "detail": detail})
+        print("[self_test] {}: {}".format("PASS" if ok else "FAIL", name), flush=True)
+        if not ok:
+            print("[self_test]   detail: {}".format(json.dumps(detail)), flush=True)
+
+    keys = ("pose_enc", "depth", "depth_conf")
+
+    # 1. A 0.0 floor -- what all five configurations actually measured -- must reduce to the
+    #    defaults exactly, so this change is a no-op against the recorded verdict. Same for
+    #    a configuration with no baseline entry at all.
+    #    The legacy-shaped zero floor is included here, not with the refusal cases below,
+    #    because it is the EXACT shape of the staged job-16 baseline (bare floats, all 0.0):
+    #    this is the assertion that makes this change a provable no-op against the recorded
+    #    verdict, refusal record included.
+    zero_floor = {k: {"max_abs_diff": 0.0, "max_rel_diff": 0.0} for k in keys}
+    legacy_zero_floor = {k: 0.0 for k in keys}
+    for path in ("bf16", "fp32"):
+        defaults, recorded = _DEFAULT_TOL[path], recorded_gate[path]
+        for label, floor in (("zero_floor", zero_floor),
+                             ("legacy_zero_floor", legacy_zero_floor),
+                             ("no_baseline_entry", {})):
+            tol = _derive_tol(defaults, floor)
+            _expect(
+                "{}_{}_reduces_to_recorded_gate".format(path, label),
+                (tol["rtol"] == defaults["rtol"] == recorded["rtol"]
+                 and tol["atol"] == defaults["atol"] == recorded["atol"]
+                 and not tol["rtol_widened_from_relative_floor"]
+                 and "rtol_widening_refused" not in tol),
+                {"derived": {"rtol": repr(tol["rtol"]), "atol": repr(tol["atol"])},
+                 "recorded_gate": {"rtol": repr(recorded["rtol"]),
+                                   "atol": repr(recorded["atol"])}},
+            )
+
+    # 2. A nonzero RELATIVE floor widens rtol -- the half of Decision 4 step 5 the previous
+    #    revision never applied -- and leaves atol at its default.
+    rel = 4e-4
+    tol = _derive_tol(_DEFAULT_TOL["bf16"],
+                      {"pose_enc": {"max_abs_diff": 0.0, "max_rel_diff": rel},
+                       "depth": {"max_abs_diff": 0.0, "max_rel_diff": 0.0}})
+    _expect(
+        "relative_floor_widens_rtol_only",
+        (tol["rtol"] == 3 * rel
+         and tol["rtol"] > _DEFAULT_TOL["bf16"]["rtol"]
+         and tol["atol"] == _DEFAULT_TOL["bf16"]["atol"]
+         and tol["rtol_widened_from_relative_floor"]
+         and tol["rel_floor_max"] == rel),
+        {"tol": {k: repr(v) for k, v in tol.items()}, "expected_rtol": repr(3 * rel)},
+    )
+
+    # 3. A nonzero ABSOLUTE floor widens atol and MUST NOT touch rtol. The floor is chosen
+    #    so 3 x it exceeds the bf16 rtol default: the naive single-max() widening would have
+    #    loosened rtol by 50% here, which is the defect this helper exists to prevent.
+    ab = 5e-4
+    tol = _derive_tol(_DEFAULT_TOL["bf16"],
+                      {"pose_enc": {"max_abs_diff": ab, "max_rel_diff": 0.0},
+                       "depth": {"max_abs_diff": 0.0, "max_rel_diff": 0.0}})
+    _expect(
+        "absolute_floor_widens_atol_never_rtol",
+        (tol["atol"] == 3 * ab
+         and tol["rtol"] == _DEFAULT_TOL["bf16"]["rtol"] == recorded_gate["bf16"]["rtol"]
+         and not tol["rtol_widened_from_relative_floor"]
+         and 3 * ab > _DEFAULT_TOL["bf16"]["rtol"]),
+        {"tol": {k: repr(v) for k, v in tol.items()},
+         "naive_rtol_would_have_been": repr(3 * ab)},
+    )
+
+    # 4. A legacy abs-only baseline (bare float per key -- the format of every artifact
+    #    written before this change) with a NONZERO floor must refuse to widen rtol and
+    #    record why, rather than widening from the wrong quantity. Only the nonzero key is
+    #    named: a 0.0 absolute floor entails a 0.0 relative floor (see _derive_tol).
+    legacy = {"pose_enc": ab, "depth": 0.0, "depth_conf": 0.0}
+    tol = _derive_tol(_DEFAULT_TOL["bf16"], legacy)
+    _expect(
+        "legacy_abs_only_baseline_records_rtol_refusal",
+        (tol.get("rtol_widening_refused") is True
+         and tol["rtol"] == _DEFAULT_TOL["bf16"]["rtol"]
+         and tol["atol"] == 3 * ab
+         and tol["rel_floor_max"] is None
+         and tol.get("rtol_refusal_keys") == ["pose_enc"]
+         and "unit error" in tol.get("rtol_refusal_reason", "")),
+        {"tol": {k: repr(v) for k, v in tol.items()}},
+    )
+
+    # Same refusal for a half-migrated entry: per-key dict, absolute half only.
+    tol = _derive_tol(_DEFAULT_TOL["bf16"], {"pose_enc": {"max_abs_diff": ab}})
+    _expect(
+        "per_key_dict_without_relative_half_records_rtol_refusal",
+        (tol.get("rtol_widening_refused") is True
+         and tol["rtol"] == _DEFAULT_TOL["bf16"]["rtol"]
+         and tol["atol"] == 3 * ab),
+        {"tol": {k: repr(v) for k, v in tol.items()}},
+    )
+
+    # 5. Both halves nonzero in the SAME call. The four cases above each move one half, so
+    #    every one of them passes against a helper that can only widen one at a time.
+    tol = _derive_tol(_DEFAULT_TOL["bf16"],
+                      {"pose_enc": {"max_abs_diff": ab, "max_rel_diff": rel},
+                       "depth": {"max_abs_diff": 0.0, "max_rel_diff": 0.0}})
+    _expect(
+        "both_halves_widen_independently_in_one_call",
+        (tol["atol"] == 3 * ab and tol["rtol"] == 3 * rel
+         and tol["abs_floor_max"] == ab and tol["rel_floor_max"] == rel
+         and tol["rtol_widened_from_relative_floor"]
+         and "rtol_widening_refused" not in tol),
+        {"tol": {k: repr(v) for k, v in tol.items()},
+         "expected": {"atol": repr(3 * ab), "rtol": repr(3 * rel)}},
+    )
+
+    # 6. THE UNFAILABLE GATE. An unbounded rtol is not a loose gate, it is the absence of
+    #    one: torch.allclose(rtol=inf) passes any two tensors and records a PASS. rtol was
+    #    pinned before the relative half existed, so this is a failure mode the relative
+    #    half introduced, and the run that first writes a nonzero-floor baseline is the run
+    #    that arms it. Each of these must hold rtol at the default and say why.
+    for label, bad_rel, expect_unusable in (("huge", 1e11, False),
+                                            ("infinite", float("inf"), True),
+                                            ("nan", float("nan"), True),
+                                            ("negative", -1e-3, True)):
+        tol = _derive_tol(_DEFAULT_TOL["bf16"],
+                          {"pose_enc": {"max_abs_diff": 0.0, "max_rel_diff": bad_rel},
+                           "depth": {"max_abs_diff": 0.0, "max_rel_diff": 0.0}})
+        # Caught rather than raised: a non-finite that reaches results.json is a FAIL with a
+        # reason, not a traceback out of the middle of the suite.
+        strict_json = _is_strict_json(tol)
+        _expect(
+            "a_{}_relative_floor_cannot_widen_rtol".format(label),
+            (tol["rtol"] == _DEFAULT_TOL["bf16"]["rtol"] == recorded_gate["bf16"]["rtol"]
+             and not tol["rtol_widened_from_relative_floor"]
+             and tol.get("rtol_widening_refused") is True
+             and ("unusable_floors" in tol) is expect_unusable
+             and strict_json),
+            {"tol": {k: repr(v) for k, v in tol.items()}, "floor": repr(bad_rel),
+             "strict_json": strict_json},
+        )
+    # ...and the same on the absolute half, which has no ceiling but must still reject a
+    #    floor that is not a finite non-negative number.
+    for label, bad_abs in (("infinite", float("inf")), ("nan", float("nan")),
+                           ("negative", -1.0)):
+        tol = _derive_tol(_DEFAULT_TOL["bf16"], {"pose_enc": {"max_abs_diff": bad_abs,
+                                                             "max_rel_diff": 0.0}})
+        _expect(
+            "a_{}_absolute_floor_cannot_widen_atol".format(label),
+            (tol["atol"] == _DEFAULT_TOL["bf16"]["atol"] == recorded_gate["bf16"]["atol"]
+             and tol["atol_widening_factor"] == 1.0
+             and tol["abs_floor_max"] is None
+             and [u["half"] for u in tol.get("unusable_floors", [])] == ["max_abs_diff"]
+             and _is_strict_json(tol)),
+            {"tol": {k: repr(v) for k, v in tol.items()}, "floor": repr(bad_abs),
+             "strict_json": _is_strict_json(tol)},
+        )
+    # And the boundary itself, from both sides, so the ceiling is a value and not a mood.
+    just_under = (_RTOL_WIDENING_CEILING / 3.0) * (1 - 1e-9)
+    tol_under = _derive_tol(_DEFAULT_TOL["bf16"], {"pose_enc": {"max_abs_diff": 0.0,
+                                                               "max_rel_diff": just_under}})
+    tol_over = _derive_tol(_DEFAULT_TOL["bf16"],
+                           {"pose_enc": {"max_abs_diff": 0.0,
+                                         "max_rel_diff": _RTOL_WIDENING_CEILING / 3.0}})
+    _expect(
+        "the_rtol_ceiling_discriminates_at_its_own_boundary",
+        (tol_under["rtol"] == 3 * just_under
+         and "rtol_widening_refused" not in tol_under
+         and tol_over["rtol"] == _DEFAULT_TOL["bf16"]["rtol"]
+         and tol_over.get("rtol_widening_refused") is True),
+        {"under": repr(tol_under["rtol"]), "over": repr(tol_over["rtol"]),
+         "ceiling": repr(_RTOL_WIDENING_CEILING)},
+    )
+
+    all_pass = all(c["pass"] for c in checks)
+    # Provenance, in the style run_kv_info_probe records its module_root: which file and
+    # which constants this verdict is about. Deliberately NOT a git revision -- the Tier 2
+    # container has no git, so a harness that tried to stamp one would report nothing or
+    # crash; the file path plus the asserted constants are what is actually available here.
+    results = {"mode": "self_test", "pass": all_pass, "complete": True,
+               "harness_file": str(Path(__file__).resolve()),
+               "defaults_asserted": _DEFAULT_TOL,
+               "recorded_gate_asserted": recorded_gate,
+               "num_checks": len(checks), "checks": checks}
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "results.json").write_text(json.dumps(results, indent=2))
+    print("[self_test] {}/{} checks passed -> {}".format(
+        sum(1 for c in checks if c["pass"]), len(checks),
+        "PASS" if all_pass else "FAIL"), flush=True)
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode",
-                        choices=["baseline", "compare", "kv_info_probe"], required=True)
-    # Not required for kv_info_probe: that mode builds only tiny synthetic models and
-    # touches neither the checkpoint nor the fixture.
+                        choices=["baseline", "compare", "kv_info_probe", "self_test"],
+                        required=True)
+    # Not required for kv_info_probe (builds only tiny synthetic models) or self_test
+    # (builds nothing at all): neither mode touches the checkpoint or the fixture.
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--tum_root", default=None)
     parser.add_argument("--scene", default=None)
@@ -984,7 +1360,9 @@ def main():
             parser.error(
                 f"--mode {args.mode} requires: {', '.join('--' + m for m in missing)}")
 
-    if args.mode == "kv_info_probe":
+    if args.mode == "self_test":
+        sys.exit(0 if run_self_test(args)["pass"] else 1)
+    elif args.mode == "kv_info_probe":
         run_kv_info_probe(args)
         sys.exit(0)
     elif args.mode == "baseline":
