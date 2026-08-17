@@ -32,6 +32,7 @@ the first attempted launch instead of in the artifact's provenance six weeks lat
 """
 import argparse
 import base64
+import fnmatch
 import hashlib
 import json
 import os
@@ -127,6 +128,47 @@ SITE_KEYS = {
 }
 
 DEFAULT_VENV_PREFERENCE = "nxd_inference"
+
+# The venv names a Neuron DLAMI actually reported, from the recorded runtime venv list. The job's
+# discovery is checked against these before anything is launched: the discovery it replaced globbed
+# `aws_neuron_venv*`, every name the DLAMI reports spells it `neuronx`, and so nothing matched. That
+# failure is silent in the worst place -- the venv stage records
+# NO_VENV_FOUND_USING_SYSTEM_PYTHON3, nkilib is unimportable under system python3, and a kernel arm
+# exits neuron_kernel_unavailable having answered nothing on an instance already paid for. The older
+# single-`neuron` spelling stays in the list so a discovery narrowed to only the current DLAMI is
+# refused too.
+# The venvs a real Neuron DLAMI reported, from the runtime list the trn2 probe captured
+# (context.md's "DLAMI venvs discovered at runtime"). All four carry the `neuronx` spelling; the
+# discovery this check replaced searched three `aws_neuron_venv*` globs and matched none of them.
+#
+# This tuple is a CONJUNCTION -- the discovery must be able to match every entry -- so nothing may
+# be added to it that a DLAMI did not report. An earlier version carried `aws_neuron_venv_pytorch`
+# "for older DLAMIs", which made the refusal below assert that the DLAMI reports a venv it does
+# not, and blocked the correct narrowing `aws_neuronx_venv*`. A name we merely *tolerate* at
+# runtime does not belong in a list of names we *require* the discovery to reach.
+DLAMI_VENV_NAMES = (
+    "aws_neuronx_venv_pytorch_2_8_nxd_inference",       # the venv REQ-095 names
+    "aws_neuronx_venv_pytorch_2_8_nxd_training",        # and the one the probe actually used
+    "aws_neuronx_venv_pytorch_2_8",
+    "aws_neuronx_venv_jax_0_7",
+)
+
+
+def strip_shell_comment(line):
+    """Drop a trailing `# ...`, respecting quotes, so a check reads what a line DOES.
+
+    Only used by the render checks. A `#` inside single or double quotes is data, not a comment.
+    """
+    quote = None
+    for i, ch in enumerate(line):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#":
+            return line[:i]
+    return line
 
 
 class Refused(Exception):
@@ -500,6 +542,25 @@ def check_rendered(text, profile, template_src=None):
                    "(constraint 5)")
     if not re.search(r'\.\s+"\$VENV/bin/activate"', text):
         refuse("no `. \"$VENV/bin/activate\"` anywhere in the rendered job (constraint 5)")
+
+    # 5b -- and the discovery must be able to FIND a venv to activate. Checked by matching every
+    # name the DLAMI reports against the patterns the job actually searches, because the discovery
+    # this replaced was three plausible-looking globs that matched none of them and said nothing.
+    #
+    # Comments are stripped first, and that is not a detail: tokenizing the raw line let PROSE
+    # satisfy the check. `VENVS=$(ls -d /opt/aws_neuron_venv*)  # was -name 'aws_neuron*venv*'`
+    # rendered clean while searching for exactly the pattern that found nothing on a real DLAMI.
+    # A comment cannot find a venv, and a `VENVS=` that survives only inside one is not a discovery.
+    discovery = [s for s in (strip_shell_comment(line) for _, line in lines) if "VENVS=" in s]
+    patterns = [os.path.basename(tok.strip("'\"()")) for line in discovery
+                for tok in line.split() if "venv" in tok]
+    for venv_name in DLAMI_VENV_NAMES:
+        if not any(fnmatch.fnmatchcase(venv_name, pat) for pat in patterns):
+            refuse(f"the job's venv discovery cannot match {venv_name}, a venv the DLAMI reports: "
+                   f"it searches for {patterns or 'nothing at all'}. Not a warning -- the venv "
+                   "stage then records NO_VENV_FOUND_USING_SYSTEM_PYTHON3, nkilib is unimportable "
+                   "under system python3, and the arm exits neuron_kernel_unavailable with the "
+                   "instance paid for (constraint 5)")
 
     # 6 -- both variables, always. One without the other and the kernel cannot identify a platform.
     for var in ("PJRT_DEVICE=NEURON", "NEURON_PLATFORM_TARGET_OVERRIDE=trn2"):

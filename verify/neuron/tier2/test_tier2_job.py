@@ -200,6 +200,115 @@ refuses("a job with no `activate` at all is refused",
         lambda: render(template=mutate('. "$VENV/bin/activate"', "true")),
         expect="constraint 5")
 
+print("\n=== constraint 5b: the discovery has to find a venv to activate ====================")
+# The defect: the discovery globbed `aws_neuron_venv*` while every venv the DLAMI reports spells it
+# `neuronx`, so it matched nothing -- and finding nothing is not an error. The stage records
+# NO_VENV_FOUND_USING_SYSTEM_PYTHON3, nkilib is unimportable under system python3, and a kernel arm
+# exits neuron_kernel_unavailable having answered nothing on an instance already paid for. TASK-N18's
+# verifying run could not have caught it: it left image_id unset and got an AMI with a driver and no
+# stack, so the venv stage had nothing to find either way. Both halves are covered here -- the render
+# refuses a discovery that cannot match, and the committed discovery is RUN against a fixture.
+DISCOVERY = ("    VENVS=$(find /opt ~ -maxdepth 3 \\\n"
+             "      \\( -name 'aws_neuron*venv*' -o -path '*/aws/neuron/venv*' \\) -type d "
+             "2>/dev/null | sort)")
+OLD_DISCOVERY = ("    VENVS=$(ls -d /opt/aws_neuron_venv* /opt/aws/neuron/venv* "
+                 "~/aws_neuron_venv* 2>/dev/null)")
+check("the discovery this section tests is the text the job actually carries", DISCOVERY in GOOD)
+refuses("a discovery that cannot match the venv REQ-095 names is refused before any spend",
+        lambda: render(template=mutate(DISCOVERY, OLD_DISCOVERY)),
+        expect="aws_neuronx_venv_pytorch_2_8_nxd_inference")
+try:
+    render(template=mutate(DISCOVERY, OLD_DISCOVERY))
+    _VENV_MSG = ""
+except Exception as _exc:                                   # noqa: BLE001
+    _VENV_MSG = str(_exc)                                   # mutate()'s own abort included: if the
+    #                                                         committed discovery text drifts, this
+    #                                                         section must say so, not test nothing
+check("...and the refusal names what an operator would grep for, not only the glob it rejected",
+      "NO_VENV_FOUND_USING_SYSTEM_PYTHON3" in _VENV_MSG
+      and "neuron_kernel_unavailable" in _VENV_MSG, _VENV_MSG)
+refuses("a discovery that searches for nothing is refused too, rather than reading as 'no venvs "
+        "are installed'",
+        lambda: render(template=mutate(DISCOVERY, '    VENVS=""')),
+        expect="nothing at all")
+# The four names the trn2 probe recorded, from context.md's "DLAMI venvs discovered at runtime".
+# L.DLAMI_VENV_NAMES is a CONJUNCTION -- the render check above requires the discovery to be able to
+# match EVERY entry -- so a name no DLAMI reports makes that check assert a falsehood and blocks the
+# correct narrowing to `aws_neuronx_venv*`. An earlier draft of this list carried
+# `aws_neuron_venv_pytorch` "for older DLAMIs" while omitting `..._nxd_training`, which is the venv
+# the probe actually used. A spelling we would merely TOLERATE at runtime does not belong in a list
+# of spellings we REQUIRE the discovery to reach.
+DLAMI_REPORTED = ("aws_neuronx_venv_jax_0_7", "aws_neuronx_venv_pytorch_2_8",
+                  "aws_neuronx_venv_pytorch_2_8_nxd_inference",
+                  "aws_neuronx_venv_pytorch_2_8_nxd_training")
+check("every name the check enforces is one a real DLAMI reported, and all four of them are",
+      set(L.DLAMI_VENV_NAMES) == set(DLAMI_REPORTED), str(L.DLAMI_VENV_NAMES))
+check("...and none of them carries the single-`neuron` spelling, which is the glob that matched "
+      "nothing on the DLAMI and is not a name to require",
+      not [n for n in L.DLAMI_VENV_NAMES if n.startswith("aws_neuron_venv")],
+      str(L.DLAMI_VENV_NAMES))
+check("...and the job's default preference is the first entry, so the refusal above is scored "
+      "against the venv REQ-095 names",
+      L.DEFAULT_VENV_PREFERENCE in L.DLAMI_VENV_NAMES[0], L.DEFAULT_VENV_PREFERENCE)
+
+# The behavioural half. The stage's own text is sliced out of the rendered job and run against a
+# fixture root: a test that reimplemented the discovery would pass with the discovery broken, which
+# is precisely the defect. The only substitution is the search root, since /opt is not writable here
+# and must not be written to anyway.
+VENV_STAGE = GOOD[GOOD.index('  VENV=""'):GOOD.index("  flush venv")]
+check("the sliced stage is the whole of it: discovery, preference, fallback, finding branch",
+      all(t in VENV_STAGE for t in ("VENVS=$(find", "LINGBOT_T2_VENV_PREFERENCE",
+                                    "NO_VENV_FOUND_USING_SYSTEM_PYTHON3",
+                                    'rec "stages.venv.status"')))
+
+
+def run_venv_stage(fixture, block=None, preference="nxd_inference"):
+    """Run the committed venv stage against a fake root, with the job's own helpers stubbed."""
+    body = (VENV_STAGE if block is None else block).replace("/opt", os.path.join(fixture, "opt"))
+    script = ("set -u\n"
+              f'LINGBOT_T2_VENV_PREFERENCE="{preference}"\n'
+              'LINGBOT_T2_PROFILE="desk-fixture"\n'
+              "say() { :; }\n"
+              'rec() { echo "$1=$2"; }\n'
+              "stage() { return 0; }\n" + body)
+    proc = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=120,
+                          env=dict(os.environ, HOME=os.path.join(fixture, "home")))
+    return dict(ln.split("=", 1) for ln in proc.stdout.splitlines() if "=" in ln), proc
+
+
+with tempfile.TemporaryDirectory() as _fix:
+    # The same four names the render check is scored against above -- a real DLAMI's, not invented
+    # spellings, and the same list so the fixture and the refusal cannot drift apart.
+    for _name in DLAMI_REPORTED:
+        os.makedirs(os.path.join(_fix, "opt", _name, "bin"))
+        open(os.path.join(_fix, "opt", _name, "bin", "activate"), "w").close()
+    # Named like a venv, missing bin/activate: neither branch may settle on it, because sourcing it
+    # is the whole point and a directory is not a venv.
+    os.makedirs(os.path.join(_fix, "opt", "aws_neuronx_venv_half_installed"))
+    os.makedirs(os.path.join(_fix, "home"))
+
+    RECS, PROC = run_venv_stage(_fix)
+    check("the committed discovery finds the spec-named venv in a fixture holding all four",
+          RECS.get("stages.venv.activated", "").endswith(
+              "aws_neuronx_venv_pytorch_2_8_nxd_inference"),
+          f"{RECS.get('stages.venv.activated')!r} stderr={PROC.stderr[-200:]!r}")
+    check("...and records matched_preference true, so the choice was the preference and not luck",
+          RECS.get("stages.venv.matched_preference") == "true", str(RECS))
+    check("...and the stage reports ACTIVATED rather than the finding branch",
+          RECS.get("stages.venv.status") == "ACTIVATED", str(RECS))
+    # The discrimination proof. Without it the check above would pass equally against a discovery
+    # that matched by accident -- and it is the same fixture, so the difference is the glob.
+    OLD_RECS, _ = run_venv_stage(_fix, block=mutate(DISCOVERY, OLD_DISCOVERY, src=VENV_STAGE))
+    check("the fixture discriminates: in it the pre-fix glob finds nothing and falls through to "
+          "system python3",
+          OLD_RECS.get("stages.venv.status") == "NO_VENV_FOUND_USING_SYSTEM_PYTHON3"
+          and OLD_RECS.get("stages.venv.activated") == "null", str(OLD_RECS))
+    NO_PREF = run_venv_stage(_fix, preference="not_a_substring_of_any_venv")[0]
+    check("with no preference match the fallback still activates a sourceable venv, and the sort "
+          "makes which one reproducible",
+          NO_PREF.get("stages.venv.activated", "").endswith("aws_neuronx_venv_jax_0_7")
+          and NO_PREF.get("stages.venv.matched_preference") == "false", str(NO_PREF))
+
 print("\n=== constraint 6: both Neuron environment variables ===============================")
 refuses("removing PJRT_DEVICE is refused",
         lambda: render(template=TEMPLATE_SRC.replace("export PJRT_DEVICE=NEURON", "true")),

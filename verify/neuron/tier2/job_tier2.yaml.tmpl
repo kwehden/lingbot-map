@@ -156,7 +156,17 @@ run: |
   # greps the whole rendered job for it, prose included.
   VENV=""
   if stage venv; then
-    VENVS=$(ls -d /opt/aws_neuron_venv* /opt/aws/neuron/venv* ~/aws_neuron_venv* 2>/dev/null)
+    # Discovery, not a fixed list of paths. Every venv the DLAMI actually reported spells it
+    # `neuronx` -- aws_neuronx_venv_pytorch_2_8_nxd_inference is the one REQ-095 names -- and the
+    # glob this replaced looked for `aws_neuron_venv*`, which matches none of them. Nothing was
+    # found, the stage fell through to NO_VENV_FOUND_USING_SYSTEM_PYTHON3 below, and from there
+    # nkilib is unimportable and a kernel arm exits neuron_kernel_unavailable having answered
+    # nothing on an instance already paid for. The runner refuses to render a discovery that
+    # cannot match the recorded venv names, so this is checked before the spend and not here.
+    # Bounded depth and -type d because this runs on a paid clock; sorted so that which venv the
+    # preference-less fallback settles on is reproducible rather than filesystem order.
+    VENVS=$(find /opt ~ -maxdepth 3 \
+      \( -name 'aws_neuron*venv*' -o -path '*/aws/neuron/venv*' \) -type d 2>/dev/null | sort)
     for v in $VENVS; do
       case "$v" in *"${LINGBOT_T2_VENV_PREFERENCE}"*) [ -f "$v/bin/activate" ] && VENV="$v" ;; esac
     done
