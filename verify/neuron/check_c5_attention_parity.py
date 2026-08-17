@@ -46,8 +46,11 @@ kernel instead of the stub. Everything above runs against ``install_cte_stub()``
 makes it desk-runnable and is also the one thing that could make a *compiled* run vacuous — a
 trn2 run that reports the stub's numbers has measured the desk twice. The arm therefore leaves
 ``NeuronAttentionAdapter._load_kernel`` alone, lets the real import happen, and records which
-kernel it got, and it scores that provenance **before** it scores any ``rel_err``. See the
-block above :func:`run_neuron_arm`. Authoring the arm is desk work; its first *execution* is
+kernel it got, and it scores that provenance **before** it scores any ``rel_err``. Checks 2 and
+5 above are the two the arm cannot inherit and re-states in its own terms: bit-equality means
+something stronger there (two devices, two reduction orders) and the negative control has to
+come from the INPUT, because the real kernel cannot be asked to ignore ``prior_used_len``. See
+the block above :func:`run_neuron_arm`. Authoring the arm is desk work; its first *execution* is
 Tier 2 and belongs to ``TASK-N21``'s C5-shape floor or ``TASK-N14a``.
 
 Run::
@@ -686,6 +689,22 @@ def measure_reference_floor(args) -> int:
 # against the sha256 the floor artifact committed before its contents are used. Unlike that
 # artifact this comparison IS cross-device, which is the axis it exists to cover.
 #
+# WHAT MAKES A GREEN RESULT MEAN ANYTHING. Provenance rules out the stub; two further guards
+# rule out the two ways a REAL kernel can still produce a vacuous pass, and both are checks
+# main() only has for the stub arm. The first is INVERTED: bit-equality with the staged
+# reference is a FAILURE. Two devices with different reduction orders cannot agree exactly on
+# correct output, so 0.0 means both sides ran the same path -- and the tolerance emit below
+# passes on worst <= tol, which 0.0 satisfies for every tol anyone could supply. It is
+# therefore scored whether or not --tolerance was given. The second is the negative control,
+# input-side by necessity: main()'s desk control installs a stub that ignores prior_used_len,
+# and the real kernel cannot be asked to ignore it, so the control instead hands attend_groups
+# a valid_len of plan.padded -- the whole tile, so tile_valid_lens makes the kernel attend
+# padding -- and requires the answer to move FURTHER from the reference than the measured cell
+# did. Without it a rel_err is not evidence that this comparison discriminates at all. Cells
+# run shallow first: the same breakage reads ~0.99 at 8 frames and ~0.014 at 1124, so sorted
+# filename order, which puts 1124f ahead of 8f, would spend the scarce trn2 minutes on the
+# insensitive depth first.
+#
 # WHAT IT DOES NOT DECIDE. No tolerance is hardcoded. TASK-N21's Phase 4 bar is
 # max(reference_floor, 3 x noise_floor) and belongs to that task; the harness's own "generous"
 # TOL=1e-4 above is not a derivation and must not become one by being reused here. --tolerance
@@ -866,8 +885,14 @@ def run_neuron_arm(args) -> int:
                           "FAIL", 1)
 
     # ---- and only now, the comparison -----------------------------------------------------
+    # Shallow first, which sorted() on the filenames is not: "c5_floor_1124f" sorts before
+    # "c5_floor_8f". The order is load-bearing rather than cosmetic -- an unhonoured tail reads
+    # ~0.99 at 8 frames and ~0.014 at 1124, so the shallow cell is the sensitive detector, and
+    # a preemption partway through must not be the reason it never ran. Every verified name is
+    # in the manifest by construction: the verification loop above rejects anything that is not.
     cells, worst, worst_at, dtypes = [], 0.0, None, set()
-    for name in verified:
+    for name in sorted(verified, key=lambda f: (manifest[f]["frames"],
+                                                manifest[f]["seqlen_q"])):
         blob = torch.load(os.path.join(args.reference_tensors, name), weights_only=False)
         ref = blob["outputs"].get(ARM_REFERENCE_MEMBER)
         row = {"file": name, "frames": blob["frames"], "seqlen_q": blob["seqlen_q"],
@@ -888,9 +913,9 @@ def run_neuron_arm(args) -> int:
             q = blob["inputs"]["q"].to(device)
             k_live = blob["inputs"]["k_live"].to(device)
             v_live = blob["inputs"]["v_live"].to(device)
-            c5, _ = build_with_adapter(HEAD_DIM, NUM_HEADS, MTF, device, check_env=True)
+            c5, adapter = build_with_adapter(HEAD_DIM, NUM_HEADS, MTF, device, check_env=True)
             replay(c5, k_live, v_live, NUM_HEADS, HEAD_DIM)
-            k_seen, v_seen, valid, _ = c5.visible_group(0, 0)
+            k_seen, v_seen, valid, plan = c5.visible_group(0, 0)
             n = int(valid)
             row["replay_is_bit_exact"] = bool(
                 n == int(k_live.shape[0])
@@ -906,12 +931,38 @@ def run_neuron_arm(args) -> int:
                 if "adapter_einsum" in blob["outputs"] else None)
         except Exception as exc:                                   # noqa: BLE001 - a cell that
             row["failed"] = f"{type(exc).__name__}: {exc}"[:300]   # cannot run is data
+
+        # The negative control gets its OWN try, and the separation is load-bearing.
+        # `valid_len == plan.padded` is an input the real attention_cte has never been given on this
+        # project, so a kernel assert here is a plausible FIRST-run outcome. Sharing the block above
+        # left such a cell both scored and `failed`: every_staged_cell_ran_and_replayed_bit_exactly
+        # reported PASS while listing the cell in its own cells_failed, and the control guard came
+        # out 0/N with the exception text nowhere in it -- an operator at $8.5964/hr read a FAIL
+        # verdict with no reason. A control that could not run is recorded as control_failed and
+        # surfaces in the guard that needed it.
+        if row.get("rel_err") is not None:
+            # From the input, on the same buffers this cell just scored: valid_len = plan.padded
+            # makes tile_valid_lens (neuron_attention.py:367) hand the kernel the whole tile, so it
+            # attends the padding rows append never wrote. full_like keeps it a 0-d device tensor --
+            # a Python int here would bake the length into the graph and cost a NEFF per frame
+            # (tile_valid_lens' docstring).
+            try:
+                ctrl = adapter.attend_groups(
+                    q[0].permute(1, 0, 2).contiguous(),
+                    [(k_seen, v_seen, torch.full_like(valid, int(plan.padded)), plan)])
+                row["control_valid_len"] = int(plan.padded)
+                row["control_rel_err"] = rel_err(
+                    ctrl.permute(1, 0, 2).unsqueeze(0).detach().cpu().float(), ref.float())
+            except Exception as exc:                                       # noqa: BLE001
+                row["control_failed"] = f"{type(exc).__name__}: {exc}"[:300]
         if row.get("rel_err") is not None and row["rel_err"] > worst:
             worst, worst_at = row["rel_err"], {"frames": row["frames"],
                                                "seqlen_q": row["seqlen_q"], "file": name}
         cells.append(row)
         print(f"    {name}: frames={row['frames']:5d} sq={row['seqlen_q']} "
-              + (f"rel_err={row['rel_err']:.3e} replay_exact={row.get('replay_is_bit_exact')}"
+              + (f"rel_err={row['rel_err']:.3e} "
+                 f"control={row.get('control_rel_err', float('nan')):.3e} "
+                 f"replay_exact={row.get('replay_is_bit_exact')}"
                  if "rel_err" in row else f"FAILED {row.get('failed')}"))
 
     scored = [c for c in cells if c.get("rel_err") is not None]
@@ -926,6 +977,83 @@ def run_neuron_arm(args) -> int:
                 "keys means this run attended something the reference never saw, and the "
                 "rel_err below would be a comparison of two different problems")
 
+    tol = args.tolerance
+
+    # ---- the vacuity guard, INVERTED: agreement to the last bit is a failure here ----------
+    bit_equal_at = [{"frames": c["frames"], "seqlen_q": c["seqlen_q"], "file": c["file"]}
+                    for c in scored if c.get("bit_equal")]
+    emit("neuron_and_gpu_do_not_agree_bit_exactly",
+         bool(scored) and not bit_equal_at and worst > 0.0,
+         worst_rel_err=f"{worst:.3e}", cells_bit_equal=bit_equal_at,
+         detail="inverted on purpose, and scored whether or not a --tolerance was supplied: "
+                "the tolerance emit below passes on worst <= tol, and 0.0 satisfies every "
+                "tolerance anyone could derive, so a bit-exact run would otherwise be written "
+                "MEASURED. Two devices with different reduction orders cannot agree exactly on "
+                "CORRECT output, so max_abs_diff == 0.0 means both sides ran the same path -- "
+                "and on this harness's history that path is install_cte_stub(). This and the "
+                "kernel-provenance guards above are the same check from two directions")
+
+    # ---- and the negative control, which on the real kernel must come from the INPUT -------
+    controlled = [c for c in scored if c.get("control_rel_err") is not None]
+    control_failures = [{"file": c["file"], "control_failed": c["control_failed"]}
+                        for c in scored if "control_failed" in c]
+    # The margin is against the MEASUREMENT, not against the caller's bar. Scoring it against `tol`
+    # imposed a silent ceiling on whatever TASK-N21 derives: the deep controls are ~1.3e-2, so any
+    # bar at or above that failed this guard on a run whose own worst error was 1.6e-06 -- a
+    # correct run rejected for having a generous bar, and in the counter-intuitive direction.
+    # Whether the bar is too generous to catch a broken mask is a real defect, but it is a
+    # DIFFERENT one and it belongs to TASK-N21's bar, so it is named separately below.
+    CONTROL_MARGIN = 100.0
+    undiscriminating = [
+        {"frames": c["frames"], "seqlen_q": c["seqlen_q"], "rel_err": c["rel_err"],
+         "control_rel_err": c["control_rel_err"]} for c in controlled
+        if not c["control_rel_err"] > CONTROL_MARGIN * c["rel_err"]]
+    emit("tail_masking_is_load_bearing_on_the_real_kernel",
+         bool(controlled) and len(controlled) == len(scored) and not undiscriminating,
+         cells_controlled=f"{len(controlled)}/{len(scored)}", margin=CONTROL_MARGIN,
+         by_cell={f"{c['frames']}f_sq{c['seqlen_q']}":
+                  f"{c['rel_err']:.3e} -> {c['control_rel_err']:.3e}" for c in controlled},
+         cells_that_did_not_discriminate=undiscriminating,
+         control_failures=control_failures,
+         detail="main()'s desk control is a stub built to ignore prior_used_len; the real "
+                "kernel cannot be asked to ignore it, so the control is input-side -- "
+                "attend_groups re-run on this cell's own buffers with valid_len = plan.padded, "
+                "the whole tile, which makes the kernel attend the padding rows append never "
+                "wrote. It must land at least 100x FURTHER from the reference than the measured "
+                "cell did, at every scored depth. If it does not, the parity gate above "
+                "discriminates nothing and a fallback, or a kernel that silently ignores "
+                "prior_used_len, reads as a pass. Cells ran shallow first because the same "
+                "breakage reads ~0.99 at 8 frames and ~0.014 at 1124. A control that could not "
+                "run at all appears in control_failures: valid_len == the tile length is an input "
+                "the real kernel has never been given here, so a kernel assert is a plausible "
+                "first-run outcome and is a finding about that contract, not about C5 parity")
+
+    # ---- and the other half of the same property: is the BAR tight enough to catch it? ------
+    # Split out of the guard above deliberately. Both are required, but they fail for opposite
+    # reasons and an operator has to be able to tell which: above, the harness cannot see a broken
+    # mask; here, it can see it and the bar would forgive it. Emitted only when a --tolerance was
+    # supplied, the same condition the parity emit itself carries -- with no bar there is no bar
+    # to be too generous, and a guard that passes on an absent input is the vacuity this file's
+    # other inversions exist to catch.
+    if tol is not None:
+        too_generous = [{"frames": c["frames"], "seqlen_q": c["seqlen_q"],
+                         "control_rel_err": c["control_rel_err"]}
+                        for c in controlled if not c["control_rel_err"] > tol]
+        emit("the_tolerance_is_tight_enough_to_reject_a_broken_mask",
+             bool(controlled) and not too_generous,
+             tolerance=tol,
+             tightest_control=(f"{min(c['control_rel_err'] for c in controlled):.3e}"
+                               if controlled else None),
+             cells_the_bar_would_forgive=too_generous,
+             detail="the parity emit passes on worst <= tol, so a tolerance at or above the "
+                    "control error would pass a run whose mask was doing nothing. That makes the "
+                    "BAR the defect rather than the port, which is why it is not folded into the "
+                    "control guard above: TASK-N21's Phase 4 bar is "
+                    "max(reference_floor, 3 x noise_floor) and nothing in that formula has an "
+                    "upper bound, yet the deep control is only ~1.3e-2. If this is the only "
+                    "failure, the run measured correctly and the bar needs re-deriving. Requires "
+                    "at least one control: with none, there is no evidence either way")
+
     # Coverage is recorded, not gated by default: TASK-N10's shallow-first rule means a first
     # trn2 run legitimately carries one cell. --require-full-geometry is what the final Phase 4
     # run passes, so a partial run can never be cited as the whole geometry either way.
@@ -936,7 +1064,6 @@ def run_neuron_arm(args) -> int:
              detail="requested explicitly. The Phase 4 run that discharges REQ-028 needs every "
                     "staged cell; a shallow-first probe does not and must not claim to")
 
-    tol = args.tolerance
     if tol is not None:
         emit("neuron_vs_staged_gpu_reference_within_tolerance", bool(scored) and worst <= tol,
              worst_rel_err=f"{worst:.3e}", tolerance=tol, worst_at=worst_at,

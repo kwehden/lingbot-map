@@ -13,13 +13,23 @@ just its passing one. Two properties are the point:
 * **A stub run is a failure, not a pass.** ``install_cte_stub()``'s numbers agree with the GPU
   reference to ~1e-6, so a silent fallback presents as success. Cases 3 and 4 install the stub
   (class-level, then instance-level) and require exit 1 with no ``rel_err`` computed at all.
+* **A green result has to be a discriminating one.** The two guards that make it so are the ones
+  a reviewer cannot check by reading a number: bit-equality is a FAILURE (case 12 -- and the
+  tolerance emit cannot catch it, since 0.0 meets every bar), and the input-side negative control
+  must move the answer at least 100x further than the measurement did (case 13, where a kernel
+  that ignores ``prior_used_len`` leaves the control sitting exactly on top of it).
+* **Two guards, because there are two ways to be undiscriminating.** Whether the harness can SEE a
+  broken mask is a property of the control; whether the caller's bar would REJECT one is a property
+  of the bar. Folding them together made a generous tolerance fail the control guard on a correct
+  run -- case 15 is that regression, and it requires the control guard to pass and the bar guard to
+  be the single named failure.
 
-**Cases 5-9 do NOT constitute a Neuron run and this file must never be cited as one.** They
-register a fake ``nkilib.core.attention`` in ``sys.modules`` so that the real, unpatched
+**Cases 5-10 and 12-15 do NOT constitute a Neuron run and this file must never be cited as one.**
+They register a fake ``nkilib.core.attention`` in ``sys.modules`` so that the real, unpatched
 ``_load_kernel`` import succeeds, which is the only way to reach the staged-reference comparison
-path (sha256 verification, replay, rel_err, tolerance scoring, coverage) from the desk. What they
-establish is that the path is correct and its guards discriminate; what runs the arm for REQ-028
-is trn2 hardware under ``TASK-N14a``, where the kernel is real and this fixture is absent.
+path (sha256 verification, replay, rel_err, control, tolerance scoring, coverage) from the desk.
+What they establish is that the path is correct and its guards discriminate; what runs the arm for
+REQ-028 is trn2 hardware under ``TASK-N14a``, where the kernel is real and this fixture is absent.
 
 Run in the Tier 1 container (torch cannot be installed on the host)::
 
@@ -327,8 +337,152 @@ check("the arm's only mention of 1e-4 is prose refusing it as a floor",
 check("the arm builds with check_env=True", "check_env=True" in armsrc)
 check("and never with check_env=False", "check_env=False" not in armsrc)
 
+print("\n=== case 12: a bit-exact result is a FAILURE, with or without a tolerance ===")
+# The shape a comparison of two identical paths makes: hand back the staged reference itself.
+# Historically that path is install_cte_stub(), and the tolerance emit cannot catch it -- 0.0
+# satisfies every bar there is -- so the guard has to be inverted and has to be scored
+# unconditionally. Only compute_attention is replaced; the control still goes through
+# attend_groups, so the control guard stays green and the failure is unambiguous.
+refs = {}
+for name in sorted(os.listdir(shallow)):
+    blob = torch.load(os.path.join(shallow, name), weights_only=False)
+    refs[int(blob["seqlen_q"])] = blob["outputs"][mod.ARM_REFERENCE_MEMBER]
+
+
+def echoing_build(head_dim, num_heads, mtf, device, check_env):
+    cache, ad = real_build(head_dim, num_heads, mtf, device, check_env)
+    cache.compute_attention = lambda i, j, q: refs[int(q.shape[2])].to(q.device)
+    return cache, ad
+
+
+mod.build_with_adapter = echoing_build
+code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
+check("exit 1, not 0", code == 1, f"code={code} verdict={art['verdict']}")
+check("the inverted guard is the only failure -- the tolerance guard passed on 0.0",
+      failing(art) == ["neuron_and_gpu_do_not_agree_bit_exactly"], str(failing(art)))
+check("worst_rel_err really was 0.0", art["worst_rel_err"] == 0.0, repr(art["worst_rel_err"]))
+inverted = next(r for r in art["results"]
+                if r["check"] == "neuron_and_gpu_do_not_agree_bit_exactly")
+check("and it names every cell that agreed bit-exactly",
+      len(inverted["cells_bit_equal"]) == 2, str(inverted["cells_bit_equal"]))
+code, art = arm(reference_tensors=shallow)
+check("scored with no --tolerance too: exit 1, not the unscored 2", code == 1,
+      f"code={code} verdict={art['verdict']}")
+check("and it is still the named failure there",
+      failing(art) == ["neuron_and_gpu_do_not_agree_bit_exactly"], str(failing(art)))
+check("with no --tolerance the bar guard is not emitted at all, rather than passing on a bar "
+      "that does not exist",
+      not [r for r in art["results"]
+           if r["check"] == "the_tolerance_is_tight_enough_to_reject_a_broken_mask"],
+      str([r["check"] for r in art["results"]]))
+mod.build_with_adapter = real_build
+
+print("\n=== case 13: a kernel that ignores prior_used_len -> the control cannot discriminate ===")
+# The real kernel's version of the desk's honour_prior_used_len=False stub. The control moves
+# only the INPUT valid_len, so a kernel that ignores it returns the identical answer and the
+# control lands exactly on the measurement -- which is what "this gate discriminates nothing"
+# looks like from the outside. The tolerance is deliberately loose enough that the parity gate
+# itself passes, so the control guard has to be the thing that catches it -- and a bar that loose
+# trips the SECOND guard as well, on its own separate cause: a 0.99 control inside a 10.0 bar means
+# this bar would have forgiven the broken mask. Two defects, two names, one run.
+att.attention_cte = mod.make_cte_stub(honour_prior_used_len=False)
+att.attention_cte.__module__ = "nkilib.core.attention"
+code, art = arm(reference_tensors=shallow, tolerance=10.0)
+check("exit 1", code == 1, f"code={code} verdict={art['verdict']}")
+check("both halves of the control property failed, each under its own name",
+      set(failing(art)) == {"tail_masking_is_load_bearing_on_the_real_kernel",
+                            "the_tolerance_is_tight_enough_to_reject_a_broken_mask"},
+      str(failing(art)))
+bar = next(r for r in art["results"]
+           if r["check"] == "the_tolerance_is_tight_enough_to_reject_a_broken_mask")
+check("and the bar guard names the cells 10.0 would have forgiven, with the bar it was given",
+      len(bar["cells_the_bar_would_forgive"]) == 2 and bar["tolerance"] == 10.0,
+      str(bar["cells_the_bar_would_forgive"])[:160])
+control = next(r for r in art["results"]
+               if r["check"] == "tail_masking_is_load_bearing_on_the_real_kernel")
+check("it names every cell where the control did not move the answer",
+      len(control["cells_that_did_not_discriminate"]) == 2,
+      str(control["cells_that_did_not_discriminate"])[:200])
+check("the control landed exactly on the measurement, which is the tell",
+      all(c["control_rel_err"] == c["rel_err"] for c in art["cells"]),
+      str([(f"{c['rel_err']:.3e}", f"{c['control_rel_err']:.3e}") for c in art["cells"]]))
+check("and the parity gate it is protecting passed on the loose bar it was given",
+      next(r for r in art["results"]
+           if r["check"] == "neuron_vs_staged_gpu_reference_within_tolerance")["pass"])
+att.attention_cte = fake_kernel
+code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
+check("with the honouring kernel back, the control discriminates and the run passes again",
+      code == 0 and failing(art) == [], f"code={code} {failing(art)}")
+check("the control is recorded at every scored cell, ~0.99 at this depth against a ~1e-7 "
+      "measurement",
+      all(c["control_rel_err"] > 0.1 > c["rel_err"] for c in art["cells"]),
+      str([(f"{c['rel_err']:.3e}", f"{c['control_rel_err']:.3e}") for c in art["cells"]]))
+check("and its valid_len was the whole tile, not the live prefix",
+      all(c["control_valid_len"] == 1152 for c in art["cells"]),
+      str([c["control_valid_len"] for c in art["cells"]]))
+
+print("\n=== case 14: the control at BOTH staged depths, and the shallow one first ===")
+# The full staged set once -- ~3 s on the A10G. Every other case uses the shallow pair because
+# a 1124-frame cell is ~2,250 sequential appends, but the deep control cannot be inferred from
+# the shallow one: 28 padding rows of 1152 is a far weaker perturbation than 1,144, and if it
+# came out anywhere near the measurement the guard shipped above would fail a CORRECT trn2 run
+# at $8.60/hr. That is a fact to establish at the desk, not on the instance.
+code, art = arm(reference_tensors=opts.staged, tolerance=measured * 100, require_full=True)
+check("exit 0 over the full staged geometry", code == 0 and failing(art) == [],
+      f"code={code} {failing(art)}")
+check("cells ran shallow first, which sorted filenames are not",
+      [c["frames"] for c in art["cells"]] == sorted(c["frames"] for c in art["cells"]),
+      str([c["file"] for c in art["cells"]]))
+deep = [c for c in art["cells"] if c["frames"] == mod.MTF]
+shallowest = [c for c in art["cells"] if c["frames"] == 8]
+check("the deep cells were controlled too, not just the shallow ones",
+      len(deep) == 2 and all(c["control_rel_err"] is not None for c in deep), str(len(deep)))
+floor = json.load(open(MANIFEST))["reference_floor_c5"]
+check("and at 1124 frames the control still clears the guard's own 100x margin over the "
+      "measurement, which is what stops it failing a correct run at depth",
+      all(c["control_rel_err"] > 100 * c["rel_err"] for c in deep),
+      str([f"{c['rel_err']:.3e} -> {c['control_rel_err']:.3e}" for c in deep]))
+check("with orders of headroom over the measured reference floor besides",
+      all(c["control_rel_err"] > 1000 * floor for c in deep),
+      f"floor={floor:.3e} controls=" + str([f"{c['control_rel_err']:.3e}" for c in deep]))
+check("the same breakage is ~50x weaker at depth than at 8 frames, which is why shallow runs "
+      "first",
+      min(c["control_rel_err"] for c in shallowest)
+      > 20 * max(c["control_rel_err"] for c in deep),
+      "shallow=" + str([f"{c['control_rel_err']:.3e}" for c in shallowest])
+      + " deep=" + str([f"{c['control_rel_err']:.3e}" for c in deep]))
+
+print("\n=== case 15: a GENEROUS bar must not fail the CONTROL guard -- why they are split ===")
+# The regression the split exists for. While the tolerance clause lived inside the control guard,
+# any bar at or above the deep control (~1.3e-2) failed
+# `tail_masking_is_load_bearing_on_the_real_kernel` on a run whose own worst error was ~1.6e-06:
+# a correct measurement rejected for having a GENEROUS bar, in the counter-intuitive direction,
+# with nothing in the output naming the bar as the reason. The ceiling itself is real -- a bar above
+# the control cannot tell a working mask from a broken one -- but it is a fact about TASK-N21's bar,
+# so it fails under its own name and the port is not blamed for it.
+code, art = arm(reference_tensors=opts.staged, tolerance=0.02)
+check("the control guard PASSES: whether the mask is load-bearing does not depend on the bar",
+      next(r for r in art["results"]
+           if r["check"] == "tail_masking_is_load_bearing_on_the_real_kernel")["pass"],
+      str(failing(art)))
+check("the bar guard is the only failure, so the cause is named and it is not the port",
+      code == 1 and failing(art) == ["the_tolerance_is_tight_enough_to_reject_a_broken_mask"],
+      f"code={code} {failing(art)}")
+check("the run itself measured correctly and inside the bar it was given",
+      art["worst_rel_err"] < 1e-4
+      and next(r for r in art["results"]
+               if r["check"] == "neuron_vs_staged_gpu_reference_within_tolerance")["pass"],
+      f"worst={art['worst_rel_err']:.3e} tol=0.02")
+bar = next(r for r in art["results"]
+           if r["check"] == "the_tolerance_is_tight_enough_to_reject_a_broken_mask")
+check("and it reports the tightest control, which IS the ceiling on any bar N21 derives",
+      float(bar["tightest_control"]) < 0.02
+      and all(c["frames"] == mod.MTF for c in bar["cells_the_bar_would_forgive"]),
+      f"tightest={bar['tightest_control']} forgiven="
+      + str([c["frames"] for c in bar["cells_the_bar_would_forgive"]]))
+
 set_env(False)
 print(f"\n===== {'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)} "
       f"({len(FAILS)} failed)")
-print("      Cases 5-9 used a fake nkilib and are NOT evidence of a Neuron run.\n")
+print("      Cases 5-10 and 12-15 used a fake nkilib and are NOT evidence of a Neuron run.\n")
 raise SystemExit(1 if FAILS else 0)
