@@ -557,8 +557,12 @@ check("and the artifact separates what was asked for from what was observed",
 
 print("\n=== case 18: a PARTIAL move is caught, and the disagreeing witness is named ===")
 # The case a single witness misses: inputs staged to the device, output materialised on the host.
-# Only the three-witness design can express it, and the artifact has to say WHICH one disagreed or
-# an operator at $8.5964/hr cannot act on the failure.
+# It takes an input-side witness AND an output-side one to express it, and the artifact has to say
+# WHICH one disagreed or an operator at $8.5964/hr cannot act on the failure. (Read "Only the
+# three-witness design can express it" until 2026-08-17, when there were four -- and the count was
+# never the point: two of the four corroborate rather than add a venue, per DEVICE_WITNESSES.)
+# The fixture splits on dtype/dim, which is NOT a mixture the arm can physically produce; what it
+# exercises is the artifact's blame-naming, not a reachable device topology.
 mod._dev = lambda t: "cpu" if t.dtype == torch.float32 and t.dim() == 4 else "xla:0"
 code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
 check("exit 1", code == 1, f"code={code} verdict={art['verdict']}")
@@ -593,6 +597,27 @@ check("same for an empty staged directory: no cells, no device claim",
       code == 1 and not [r for r in art["results"]
                          if r["check"] == "compared_tensors_ran_on_a_neuron_device"],
       f"code={code}")
+# Both checks above return at the "no verified staged reference" early exit, so they establish that
+# the guard is ABSENT and never that it reads False -- which left `bool(scored) and not offending`
+# untested: dropping the conjunct kept this suite at ALL PASS (mutation run 2026-08-17, in place,
+# 130/130 on the mutant). That is the same shape as the reverted-call-site mutation case 21 exists
+# for, so it gets the same treatment: reach the emit with a VERIFIED reference and zero scored
+# cells. A first trn2 run dying inside the loop on a kernel assert is the arm's own stated
+# expectation, so this is the reachable route, not a contrived one.
+real_replay = mod.replay
+mod.replay = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("every cell dies in the loop"))
+try:
+    code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
+finally:
+    mod.replay = real_replay
+dg19 = [r for r in art["results"] if r["check"] == "compared_tensors_ran_on_a_neuron_device"]
+check("with the reference VERIFIED and every cell dead, the guard is present and reads FAIL "
+      "on zero evidence rather than passing because nothing disagreed",
+      code == 1 and len(dg19) == 1 and dg19[0]["pass"] is False
+      and dg19[0]["witnesses_per_cell"] == []
+      and art["neuron_device_observed"] is False,
+      f"code={code} present={len(dg19)} "
+      f"{dg19[0]['pass'] if dg19 else None} obs={art.get('neuron_device_observed')}")
 
 print("\n=== case 20: the two BLOCKED paths are untouched, which is the placement tripwire ===")
 # The guard sits after all five early returns. If it ever migrates above them, these counts move

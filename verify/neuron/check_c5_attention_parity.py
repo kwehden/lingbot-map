@@ -48,7 +48,10 @@ trn2 run that reports the stub's numbers has measured the desk twice. The arm th
 ``NeuronAttentionAdapter._load_kernel`` alone, lets the real import happen, and records which
 kernel it got **and which device ran it** — the second axis was added 2026-08-17, because
 recording which kernel OBJECT loaded left a cpu-resolved trn2 run passing every provenance guard
-— and it scores that provenance **before** it scores any ``rel_err``. Checks 2 and
+— and it scores that provenance **before** any ``rel_err`` is scored against a bar. The two axes
+are not equally early and the difference is recorded at the guard: the kernel guards ``return``
+before computing anything, while the device emit sits after the comparison loop, so the per-cell
+numbers exist on disk by the time it runs. Deliberate — the trn2 hour is spent by then. Checks 2 and
 5 above are the two the arm cannot inherit and re-states in its own terms: bit-equality means
 something stronger there (two devices, two reduction orders) and the negative control has to
 come from the INPUT, because the real kernel cannot be asked to ignore ``prior_used_len``. See
@@ -725,10 +728,17 @@ ARM_REFERENCE_MEMBER = "sdpa_fused"       # the fused GPU member: REQ-021's comp
 # to a guess.
 NON_NEURON_DEVICE_TYPES = ("cpu", "cuda", "meta")
 
-# The three points at which a device is observable, plus the control's. All four are recorded per
-# cell and all four are scored: a partial move -- inputs staged to the device, output materialised
-# on the host, or a control that ran somewhere the measurement did not -- is exactly the case a
-# single witness would miss.
+# Two INDEPENDENT venues plus two corroborating reads, and the distinction is worth stating because
+# the first version of this comment claimed all four were independently load-bearing. They are not,
+# on any path reachable in this repository: `kv_device` is the input side (what attend_groups is
+# actually handed) and `compute_device` is the output side (the tensor that gets compared), and
+# those two are what make a PARTIAL move -- inputs staged to the device, output materialised on the
+# host -- expressible at all. `input_device` re-reads a tensor moved by the line above it, and
+# `control_device` cannot differ in device *type* from `compute_device`, since both come out of
+# `adapter.attend_groups` over the same buffers in the same process. They are recorded anyway, and
+# scored anyway, for one reason: this arm gets a single paid trn2 hour, and a corroborating read
+# costs nothing while an inference about a stack no run here has executed costs the hour. Score all
+# four; claim independence for two.
 DEVICE_WITNESSES = ("input_device", "kv_device", "compute_device", "control_device")
 
 
@@ -1004,8 +1014,9 @@ def run_neuron_arm(args) -> int:
             row["input_device"] = _dev(q)
             replay(c5, k_live, v_live, NUM_HEADS, HEAD_DIM)
             k_seen, v_seen, valid, plan = c5.visible_group(0, 0)
-            # The tensors attend_groups actually hands the kernel, so this is the load-bearing
-            # witness of the three: `device` above is what was requested, this is what happened.
+            # The tensors attend_groups actually hands the kernel, so this is the input-side
+            # witness of the two independent ones: `device` above is what was requested, this is
+            # what happened. (Read "of the three" until 2026-08-17, when there were four.)
             row["kv_device"] = _dev(k_seen)
             n = int(valid)
             row["replay_is_bit_exact"] = bool(
@@ -1095,8 +1106,13 @@ def run_neuron_arm(args) -> int:
          witnesses_per_cell=[{"file": c["file"],
                               **{w: c[w] for w in DEVICE_WITNESSES if w in c}} for c in scored],
          cells_on_a_non_neuron_device=offending,
-         detail="scored before any rel_err, for the reason the kernel-provenance guards are: a "
-                "discrepancy from an unknown venue misleads rather than under-informs. It reads "
+         detail="scored before any rel_err is scored AGAINST A BAR, for the reason the "
+                "kernel-provenance guards are: a "
+                "discrepancy from an unknown venue misleads rather than under-informs. Note the "
+                "narrower claim than the kernel guards can make -- they return before computing "
+                "anything, while this emit sits after the comparison loop, so every per-cell "
+                "rel_err already exists on disk when it runs. That is deliberate: the run is paid "
+                "for by then and the numbers are worth keeping. It reads "
                 "the tensors' own .device, captured inside the loop before the host-side .cpu() "
                 "normalisation erases it, and it excludes rather than requires -- naming the "
                 "string a Trainium device reports would fail a run that DID execute on Neuron, "
