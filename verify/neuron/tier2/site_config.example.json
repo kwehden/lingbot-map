@@ -23,7 +23,13 @@
     "not a fact about the world: SkyPilot's catalog prices some trn2 sizes in exactly one zone,",
     "and which zone has capacity is a property of the account. A run may come back on the second",
     "entry -- which is why the category is derived from IMDS on the instance rather than from",
-    "what was requested here (REQ-090)."
+    "what was requested here (REQ-090).",
+    "List more than one. TASK-N18's verifying run had all three zones in the list refuse with",
+    "InsufficientInstanceCapacity on the first pass -- each error naming the other two as having",
+    "capacity -- and then succeeded on the retry in the zone that had refused first. A single-zone",
+    "list turns that transient into a job that sits in PENDING and backs off indefinitely, which is",
+    "what happened on the attempt before. Do not read the zone that wins as the zone with capacity,",
+    "and do not read a refusal as lasting longer than the few seconds it was printed in."
   ],
 
   "subnet_id": "subnet-REPLACE",
@@ -64,9 +70,16 @@
 
   "image_id": "ami-REPLACE",
   "_image_id_note": [
-    "Optional. Pinning the DLAMI is the cleanest way to satisfy REQ-088's fourth item; left",
-    "unset, the pin depends on the AMI id the instance reports, which sdk_versions.py records",
-    "either way. A tolerance derived under one pinned set is not valid under another."
+    "Optional to the launcher, NOT optional in practice for any profile except noop. Pinning the",
+    "DLAMI satisfies REQ-088's fourth item, and sdk_versions.py records whichever AMI the instance",
+    "reports either way -- but that is only the recording half. TASK-N18's verifying run left this",
+    "unset and SkyPilot picked its own AMI: the Neuron DRIVER was present (neuron_ls enumerated the",
+    "device, /dev/neuron0 existed) and the Python stack was entirely absent -- no venv at any",
+    "searched path, and torch, torch_xla, torch_neuronx, neuronxcc, neuronx_distributed,",
+    "neuronx_distributed_inference and nkilib all unimportable. A driver without a stack looks like",
+    "a working instance right up to the first import. So set this to a Neuron DLAMI for anything",
+    "that runs a model; the run will otherwise pay for capacity it cannot use.",
+    "A tolerance derived under one pinned set is also not valid under another."
   ],
 
   "reference_uri": "s3://REPLACE-bucket/REPLACE/prefix/c5_reference_tensors",

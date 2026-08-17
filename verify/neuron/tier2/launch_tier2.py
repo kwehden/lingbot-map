@@ -55,18 +55,24 @@ PROFILES = {
     "noop": {
         "stages": ALWAYS + ("noop", "complete"),
         "invokes_nki_kernel": False,
+        "needs_neuron_python_stack": False,
         "purpose": "TASK-N18's own verification: launch, usable state, artifact to S3, teardown. "
                    "Computes no numbers on purpose -- a figure here would get cited.",
     },
     "c5-parity": {
         "stages": ALWAYS + ("repo", "reference", "c5_arm", "complete"),
         "invokes_nki_kernel": True,
+        "needs_neuron_python_stack": True,
         "purpose": "TASK-N14a / Phase 4 V5: run check_c5_attention_parity.py --arm neuron against "
                    "owed step 2's staged GPU reference. Invokes attention_cte, so trn2 only.",
     },
     "env-probe": {
         "stages": ALWAYS + ("repo", "complete"),
         "invokes_nki_kernel": False,
+        # False on purpose, and not by oversight: this profile's output IS the importability of the
+        # stack, so an instance with no stack produces a valid env-probe result rather than a wasted
+        # run. It is the one profile for which an unpinned AMI is a legitimate question.
+        "needs_neuron_python_stack": False,
         "purpose": "Environment and version capture with the tree cloned but nothing computed: "
                    "REQ-088's pin, and the REQ-095 module/venv facts TASK-N19's gate needs.",
     },
@@ -239,6 +245,43 @@ def check_category(instance_type, category, profile_name, allow_expensive):
         "note": "this records the REQUEST. The category actually reached is derived on the "
                 "instance from IMDS by stages/identity.py and recorded as category_reached; "
                 "REQ-090 scores that one",
+    }
+
+
+def check_image_pin(site, profile_name, allow_unpinned):
+    """Refuse a profile that needs the Neuron Python stack on an AMI nobody chose.
+
+    TASK-N18's verifying run is why this exists. It left ``image_id`` unset, SkyPilot picked its own
+    AMI, and the instance came up with the Neuron *driver* working -- ``neuron_ls`` enumerated the
+    device, ``/dev/neuron0`` was there -- and no Python stack whatsoever: no venv at any searched
+    path, and torch, torch_xla, torch_neuronx, neuronxcc, neuronx_distributed,
+    neuronx_distributed_inference and nkilib all unimportable. The ``noop`` profile passed anyway
+    because it asks for none of them, so the gap is invisible in exactly the run that proves the
+    plumbing works, and would have surfaced on the first expensive one.
+
+    A driver without a stack is the failure mode this refusal is for: it looks like a working
+    instance right up to the first import, which on trn2 is several dollars and a provisioning wait
+    after the money starts. The override exists because "does this AMI have a stack?" is a legitimate
+    question -- but it has to be asked on purpose, and it is recorded when it is.
+    """
+    profile = PROFILES[profile_name]
+    pinned = bool(site.get("image_id"))
+    if profile["needs_neuron_python_stack"] and not pinned and not allow_unpinned:
+        refuse(f"profile {profile_name!r} runs a model, and site config pins no image_id. The AMI "
+               "SkyPilot then chooses is not guaranteed to be a Neuron DLAMI: TASK-N18's verifying "
+               "run got one with the driver present and torch, torch_neuronx, neuronxcc, "
+               "neuronx_distributed and nkilib all unimportable, which is an instance that cannot "
+               "run this profile at all. Set image_id to a Neuron DLAMI -- which also satisfies "
+               "REQ-088's fourth item -- or pass --allow-unpinned-image if discovering what the "
+               "default AMI carries is the actual intent, and the override is recorded")
+    return {
+        "image_id": site.get("image_id"),
+        "pinned": pinned,
+        "profile_needs_neuron_python_stack": profile["needs_neuron_python_stack"],
+        "unpinned_image_override": bool(allow_unpinned and profile["needs_neuron_python_stack"]
+                                        and not pinned),
+        "note": "REQ-088's pin is recorded either way by stages/sdk_versions.py, from the AMI id "
+                "the instance reports. Recording which AMI ran is not the same as choosing it",
     }
 
 
@@ -708,6 +751,9 @@ def build_parser():
     ap.add_argument("--allow-expensive-venue", action="store_true",
                     help="run a no-NKI-kernel check on trn2 anyway, against REQ-090's cheapest-"
                          "sufficient rule. Recorded in the manifest with this flag named")
+    ap.add_argument("--allow-unpinned-image", action="store_true",
+                    help="run a model-running profile without a pinned image_id. The default AMI "
+                         "carried the Neuron driver and no Python stack at all; recorded when used")
     ap.add_argument("--c5-tolerance", type=float, default=None,
                     help="passed to the C5 arm. No default: the arm exits 2 MEASURED_NOT_SCORED "
                          "without one, and 2 is not a pass")
@@ -754,6 +800,7 @@ def main(argv=None):
 
     category = check_category(opts.instance_type, opts.category, opts.profile,
                               opts.allow_expensive_venue)
+    image_pin = check_image_pin(site, opts.profile, opts.allow_unpinned_image)
 
     revision = None
     if opts.skip_revision_check:
@@ -791,6 +838,7 @@ def main(argv=None):
         "region": site["region"],
         "zones": site["zones"],
         "category": category,
+        "image_pin": image_pin,
         "revision": revision,
         "rendered_yaml": yaml_path,
         "rendered_sha256": hashlib.sha256(rendered.encode()).hexdigest(),

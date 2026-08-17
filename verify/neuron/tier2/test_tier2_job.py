@@ -705,6 +705,42 @@ L.check_controller("i-fixture", "us-west-2",
 check("the check asks the region it was given, not a region it inferred",
       "us-west-2" in _seen[0] and "--region" in _seen[0], _seen[0])
 
+print("\n=== a driver is not a stack: the image pin ========================================")
+# TASK-N18's verifying run left image_id unset. SkyPilot's default AMI came up with the Neuron
+# driver working -- neuron_ls enumerated the device, /dev/neuron0 was there -- and torch, torch_xla,
+# torch_neuronx, neuronxcc, neuronx_distributed, neuronx_distributed_inference and nkilib every one
+# unimportable, with no venv at any searched path. The noop profile passed anyway, which is the trap:
+# the gap is invisible in exactly the run that proves the plumbing and would surface on the first
+# expensive one. These checks are the difference between having learned that and having noted it.
+refuses("a model-running profile with no pinned image_id is refused before any capacity is asked "
+        "for, because the default AMI carried a driver and no stack",
+        lambda: L.check_image_pin({}, "c5-parity", False),
+        expect="image_id")
+try:
+    L.check_image_pin({}, "c5-parity", False)
+    _PIN_MSG = ""
+except L.Refused as _exc:
+    _PIN_MSG = str(_exc)
+check("...and the refusal names the modules that were missing, so the next reader does not have to "
+      "reproduce the run to find out",
+      all(m in _PIN_MSG for m in ("torch", "neuronxcc", "nkilib")), _PIN_MSG)
+check("a pinned image_id satisfies it, and the pin is recorded",
+      L.check_image_pin({"image_id": "ami-" + "0" * 17}, "c5-parity", False)["pinned"] is True)
+check("noop needs no pin: it imports nothing, which is why it could verify the plumbing on an AMI "
+      "that could not have run anything else",
+      L.check_image_pin({}, "noop", False)["pinned"] is False)
+# env-probe is False on purpose. Its output IS the importability of the stack, so an instance with
+# no stack is a valid result rather than a wasted run -- the one profile for which an unpinned AMI
+# is a legitimate question. A test, so that "False" is not later read as an oversight and "fixed".
+check("env-probe is exempt by intent, not by omission: an absent stack is its finding",
+      L.check_image_pin({}, "env-probe", False)["profile_needs_neuron_python_stack"] is False)
+_OV = L.check_image_pin({}, "c5-parity", True)
+check("the override is allowed and recorded, so an unpinned expensive run is on the record as a "
+      "choice somebody made", _OV["unpinned_image_override"] is True and _OV["pinned"] is False)
+check("the override is not recorded when there was nothing to override",
+      L.check_image_pin({"image_id": "ami-" + "0" * 17}, "c5-parity", True)[
+          "unpinned_image_override"] is False)
+
 print("\n=== run ids ======================================================================")
 RID = L.make_run_id("noop", FAKE_HEAD, now=1_776_000_000)
 check("a run id carries the revision that produced it (Phase 0 recorded neither -- finding #40)",
@@ -769,6 +805,9 @@ check("the example site config ships placeholders only",
 
 print(f"\n===== {'ALL PASS' if not FAILS else 'FAILURES: ' + '; '.join(FAILS)} "
       f"({len(FAILS)} failed of {len(TOTAL)} checks)")
-print("      Nothing here launched anything. TASK-N18's verification needs a real trn2 run:\n"
-      "      rendering, a dry-run, a quota and a spot price all establish nothing (REQ-087).\n")
+print("      Nothing here launched anything, and passing this file is not TASK-N18's verification:\n"
+      "      rendering, a dry-run, a quota and a spot price all establish nothing (REQ-087). That\n"
+      "      verification was discharged separately by an actual run that reached a usable state,\n"
+      "      on inf2.xlarge -- REQ-090's cheap venue for a kernel-free check, not on trn2. Whether\n"
+      "      trn2 capacity is obtainable is still an open question no test here can answer.\n")
 raise SystemExit(1 if FAILS else 0)

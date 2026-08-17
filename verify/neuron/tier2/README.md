@@ -89,6 +89,11 @@ dry-run returned "Request would have succeeded" for a `trn1.2xlarge` in an AZ wh
 a night when H100 was provably unobtainable in all six configured regions. The only admissible
 evidence is an actual launch that reached a usable state.
 
+Add a fifth rejected class from finding 6 below: **the remediation sentence inside a capacity error**
+("you can currently get capacity by choosing …"). Three of those arrived within nine seconds naming
+each other's zones, so they cannot all have been true, and one named a zone that had refused four
+seconds earlier. It reads like an answer and is not one.
+
 So the launcher writes `"capacity_evidence": null` into its manifest and *cannot* make it true.
 The only writer of the run's `capacity` block is `stages/identity.py`, which runs on the instance
 and populates it because an instance answered IMDS with its own id — the one thing none of the four
@@ -177,16 +182,53 @@ follow-up command — the earlier `sky down` shape only ran if somebody remember
    before sending anything — because an instance id is not a durable name for a controller either,
    and the one this runner was written against no longer exists in any state.
 
+## Three things the verifying run surfaced
+
+5. **An unpinned `image_id` yields an instance with the Neuron driver and nothing else.** The
+   verifying run left `image_id` unset, so SkyPilot chose its own AMI. `neuron_ls` enumerated the
+   device and `/dev/neuron0` existed — the driver was there — and the `venv` stage found no venv at
+   any searched path, and all eight recorded modules were unimportable: `torch`, `torch_xla`,
+   `torch_neuronx`, `neuronxcc`, `neuronx_distributed`, `neuronx_distributed_inference`, `nkilib`,
+   `nkilib.core.attention`. The run still passed, because `noop` asks for nothing that needs them.
+   No other profile is runnable on that AMI. `image_id` is therefore not the optional convenience
+   its note used to describe; leaving it unset is how you pay for an instance that cannot do the
+   work. Constraints 5, 6 and 7 all went unexercised for exactly this reason.
+
+6. **The capacity error's own remediation advice was falsified in all three directions within
+   seconds.** First pass: `us-east-2b` refused with `InsufficientInstanceCapacity` and said to try
+   2a or 2c; 2a refused four seconds later and said to try 2b or 2c; 2c refused five seconds after
+   that and said to try 2a or 2b. Every zone named the other two as having capacity while refusing
+   itself. SkyPilot then retried the list and 2b — the zone that had refused first — succeeded. So a
+   refusal does not persist twenty seconds, and the *remediation text inside an AWS capacity error*
+   joins the four evidence classes REQ-087 already rejects. That is the fourth independent
+   confirmation on this project, and the sharpest: the two claims were simultaneous and
+   contradictory, so at least one was wrong at the moment it was printed.
+
+7. **The rebalance-recommendation path is exercised, not just asserted.** The run received a spot
+   rebalance recommendation and finished anyway. `tier2_interrupt.json` carries a
+   `rebalance_recommended_utc` and no `cause`, so `verdict.py` merged it as a warning; the verdict
+   is `PASS` and `inconclusive_stages` is empty. The distinction the interruption section describes
+   between a recommendation and an actual interruption now has a run behind it.
+
 ## Status
 
-Authored, statically validated, and desk-tested. **Not verified.** TASK-N18's verification requires
-a no-op run that launches, reaches a usable state, writes its artifact to S3 and tears down with no
-orphaned volumes — on real trn2 spot capacity at real cost. That has not happened.
+**Verified.** TASK-N18's verification is discharged by run `20260817T160414Z-0a536bd-3bf89d`: it
+launched from the committed job, obtained spot capacity (one `inf2.xlarge` in `us-east-2b`; the
+instance id is in the run's own artifact, not here), reached a usable state, flushed its artifact to
+S3 after every stage, wrote
+`terminal_state: reached_complete_stage` with verdict `PASS`, and its cluster was terminated by the
+managed-job mechanism — leaving no running instance and no volume in `available` state.
 
-It is also blocked by an ordering trap the task records: constraint 4 requires `git ls-remote` to
-match local HEAD, and committing this runner moves HEAD past what TASK-N00 published. Completing
-TASK-N18 breaks the very check it encodes. Re-run TASK-N00's publish steps after committing here,
-before any task uses this runner.
+Two limits on what that verifies. It ran on **`inf2.xlarge`, not `trn2.48xlarge`**, which is
+REQ-090's correct venue for a kernel-free check and about 113× cheaper; whether trn2 capacity is
+obtainable is a separate question this run does not touch. And it landed in **`us-east-2b`**, so it
+says nothing about placement in `us-east-2c` / the private-c subnet — that was a secondary goal, and
+finding 6 is why it was given up rather than retried.
+
+The ordering trap the task records is also discharged. Constraint 4 requires `git ls-remote` to
+match local HEAD, and committing this runner moved HEAD past what TASK-N00 published; TASK-N00's
+publish steps were re-run for the new revision first, so the run's `revision` block records
+`local_head == published_head == 0a536bd`.
 
 ## Usage
 
