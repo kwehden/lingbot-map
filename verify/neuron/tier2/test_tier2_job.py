@@ -18,7 +18,7 @@ The four requirement-level properties are tested the same way:
 * **REQ-090/REQ-081** -- the two venue combinations that are wrong for a reason rather than for a
   price, plus the profile/category contradictions.
 * **REQ-064** -- teardown refuses any cluster name the runner did not generate, and its command
-  contains no destructive verb beyond ``sky down`` on that one cluster.
+  contains no destructive verb beyond ``sky jobs cancel -n`` on that one job name.
 
 Finally a secret scan over every file in ``tier2/``, because this repository has public remotes.
 The scan has an emptiness guard -- a scan that examined nothing passes trivially, which is the
@@ -605,9 +605,11 @@ DOWN = L.ssm_commands("lingbot-t2-noop-x123456", "", make_opts())["down"]
 for verb in ("terminate-instances", "delete-volume", "delete-network-interface", "aws ec2 delete",
              "--force", "rm -rf"):
     check(f"the teardown command contains no {verb!r}", verb not in DOWN)
-check("the teardown command names exactly one cluster",
-      DOWN.count("lingbot-t2-noop-x123456") == 2 and "sky down -y" in DOWN)
+check("the teardown command names exactly one job",
+      DOWN.count("lingbot-t2-noop-x123456") == 2 and "sky jobs cancel -n" in DOWN)
 check("orphaned volumes are reported, not deleted", "do not delete them" in LSRC)
+check("teardown cancels a named managed job rather than downing a cluster, because a cluster name "
+      "can be reused and a job name cannot", "sky down" not in DOWN)
 
 print("\n=== the launcher's own refusals ===================================================")
 with tempfile.TemporaryDirectory() as tmp:
@@ -656,10 +658,52 @@ with tempfile.TemporaryDirectory() as tmp:
           man["category"]["requested"] == "no-nki-kernel")
     check("a skipped revision check is recorded as skipped, not as passed",
           man["revision"]["skipped"] is True)
-    check("the SSM launch body is emitted for a human to run", "sky launch" in
+    check("the SSM launch body is emitted for a human to run", "sky jobs launch -n" in
           man["next"]["ssm_command_launch"])
     check("...detached, because acquiring capacity outlasts a single SSM command",
           all(t in man["next"]["ssm_command_launch"] for t in ("setsid", "nohup", "< /dev/null")))
+    # The controller carries an admin policy that raises on CLUSTER_LAUNCH, so `sky launch` is
+    # refused there before any capacity is requested. This assertion is the whole reason the first
+    # version of this runner could not have worked, and it is cheap to keep.
+    check("the launch is a managed job, never a direct cluster launch: the controller's admin "
+          "policy refuses CLUSTER_LAUNCH outright",
+          "sky launch" not in man["next"]["ssm_command_launch"])
+    check("the poll reads the managed-job queue, not cluster status",
+          "sky jobs queue" in man["next"]["ssm_command_poll"]
+          and "sky status" not in man["next"]["ssm_command_poll"])
+
+print("\n=== the controller is a fact to check, not a field to trust =======================")
+
+
+class _Proc:
+    def __init__(self, rc=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = rc, stdout, stderr
+
+
+_ONLINE = json.dumps({"InstanceInformationList": [{"PingStatus": "Online",
+                                                   "AgentVersion": "3.3.4851.0"}]})
+check("an Online controller passes and its ping status is returned for the manifest",
+      L.check_controller("i-fixture", "us-east-1",
+                         runner=lambda cmd: _Proc(0, _ONLINE))["ping_status"] == "Online")
+refuses("a controller id SSM does not know is refused, naming BOTH candidate causes",
+        lambda: L.check_controller("i-fixture", "us-east-2",
+                                   runner=lambda cmd: _Proc(0, '{"InstanceInformationList": []}')),
+        expect="controller_region")
+refuses("a controller that is ConnectionLost is refused, because send-command would be accepted "
+        "and never delivered",
+        lambda: L.check_controller(
+            "i-fixture", "us-east-1",
+            runner=lambda cmd: _Proc(0, json.dumps(
+                {"InstanceInformationList": [{"PingStatus": "ConnectionLost"}]}))),
+        expect="not Online")
+# The bug this guards: send-command's --region was the JOB's region, while its target is the
+# controller. A controller in us-east-1 launching a trn2 job into us-east-2 is the normal case,
+# not an exotic one, and it failed with an InvalidInstanceId that named neither field.
+_seen = []
+L.check_controller("i-fixture", "us-west-2",
+                   runner=lambda cmd: (_seen.append(cmd), _Proc(0, _ONLINE))[1])
+check("the check asks the region it was given, not a region it inferred",
+      "us-west-2" in _seen[0] and "--region" in _seen[0], _seen[0])
 
 print("\n=== run ids ======================================================================")
 RID = L.make_run_id("noop", FAKE_HEAD, now=1_776_000_000)

@@ -33,14 +33,26 @@
     "desk; it runs on the controller instance, and the subnet it places instances in comes from",
     "the controller's own ~/.sky/config.yaml rather than from a task YAML field. So these two",
     "keys document the venue the run is expected to land in and let the launcher record it in the",
-    "manifest; making them take effect is a controller-side change. This is the one part of the",
-    "job that cannot be verified without a launch."
+    "manifest; making them take effect is a controller-side change.",
+    "How the placement actually resolves, since this note used to say it was unknowable without a",
+    "launch: a controller config that pins `aws.vpc_names` selects the VPC by NAME, and SkyPilot",
+    "then picks a subnet inside it that is in the zone the job asked for. So `zones` -- which IS",
+    "rendered -- is the field that steers placement, and a subnet added to that VPC in a new zone",
+    "becomes eligible with no controller change at all. Read the controller's config before",
+    "assuming the subnet id below is what takes effect; it is a record, not an instruction."
   ],
 
   "controller_instance_id": "i-REPLACE",
+  "controller_region": "us-REPLACE-0",
   "_controller_note": [
     "The SkyPilot controller, reached over SSM. Required only for --launch: without it the",
-    "launcher renders and prints the SSM command bodies for someone to run themselves."
+    "launcher renders and prints the SSM command bodies for someone to run themselves.",
+    "controller_region is where the CONTROLLER runs, which is NOT necessarily `region` above --",
+    "that one is where the job launches. One controller launches into many regions, and a config",
+    "with `use_ssm` reaches the instance without needing to share its network. These were a single",
+    "field once, and send-command went to the job's region and got InvalidInstanceId. Defaults to",
+    "`region` when unset. An instance id is also not a durable name: controllers get rebuilt, so",
+    "--launch checks the id is Online in that region before sending anything."
   ],
 
   "repo_url": "https://github.com/REPLACE/REPLACE.git",

@@ -129,11 +129,15 @@ with `pending_req089` set rather than implying an attribution the run cannot sup
 
 ## Teardown
 
-`--teardown` refuses any cluster name this runner did not generate, and emits `sky down` for that
-one cluster and nothing else — no `terminate-instances`, no `delete-volume`, no filter that could
+`--teardown` refuses any name this runner did not generate, and emits `sky jobs cancel -n` for that
+one job and nothing else — no `terminate-instances`, no `delete-volume`, no filter that could
 match a resource this initiative did not create. Surviving volumes are **reported, not deleted**:
 REQ-064 forbids deleting or terminating any capacity-allocation resource without explicit user
 direction, and an orphan of unknown provenance is precisely that case.
+
+Teardown is mostly a fallback now, because the run is a **managed job**: SkyPilot terminates the
+job's cluster when the job ends, including when it fails. That is a stronger form of REQ-064 than a
+follow-up command — the earlier `sky down` shape only ran if somebody remembered to run it.
 
 ## Two things authoring this surfaced
 
@@ -148,7 +152,30 @@ direction, and an orphan of unknown provenance is precisely that case.
    desk; it runs on the controller, and the subnet it places instances in comes from the
    controller's own config. `subnet_id` and `vpc_name` are therefore shape-validated and recorded
    in the manifest but not rendered into the job. Making them take effect is a controller-side
-   change. This is the one part of the job that cannot be verified without a launch.
+   change.
+
+   This paragraph used to end "the one part of the job that cannot be verified without a launch."
+   That was wrong, and reading the controller's config instead of launching against it is what
+   showed why: a config that pins `aws.vpc_names` selects the VPC **by name**, and SkyPilot then
+   picks a subnet inside it that sits in the zone the job asked for. `zones` *is* rendered. So a
+   subnet added to that VPC in a new zone becomes eligible with no controller change at all, and
+   the placement mechanism is readable in advance — only whether capacity exists in it is not.
+
+## Two things launching against a real controller surfaced
+
+3. **`sky launch` could never have worked here.** The controller carries an admin policy that
+   raises on `CLUSTER_LAUNCH` and `CLUSTER_EXEC`: direct cluster launches are refused, `sky jobs
+   launch` is the accepted entry point, and managed jobs auto-terminate to stop idle clusters
+   accumulating cost. The first version of this runner emitted `sky launch -c NAME`, which the
+   controller would have rejected before requesting any capacity — and `sky jobs launch` has no
+   `-c` flag at all. Found by reading the installed policy, not by paying for a launch.
+
+4. **The controller's region and the job's region are different facts.** `--launch` sent
+   `ssm send-command --region` the *job's* region while its target is the controller, which sits in
+   another one; a controller with `use_ssm` reaches instances in regions it does not live in. There
+   is now a `controller_region` key, and `--launch` checks the controller is `Online` to SSM there
+   before sending anything — because an instance id is not a durable name for a controller either,
+   and the one this runner was written against no longer exists in any state.
 
 ## Status
 

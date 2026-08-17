@@ -106,6 +106,11 @@ SITE_KEYS = {
     "vpc_name": (r"^[A-Za-z0-9_\-]{1,64}$", "VPC name as SkyPilot's config names it", False),
     "controller_instance_id": (r"^i-[0-9a-f]{8,17}$", "SkyPilot controller, reached over SSM",
                                False),
+    # Where the controller *is*, which is not where the job *runs*. Conflating the two sent
+    # send-command at the job's region and got InvalidInstanceId, because the controller sits in
+    # one region and launches into others; `use_ssm` is what makes that work.
+    "controller_region": (r"^[a-z]{2}-[a-z]+-\d$",
+                          "region the SkyPilot controller runs in; defaults to `region`", False),
     "repo_url": (r"^(https://|git@)[A-Za-z0-9._:/\-]+$", "git remote the instance clones", False),
     "image_id": (r"^ami-[0-9a-f]{8,17}$", "DLAMI to pin (REQ-088)", False),
     "reference_uri": (r"^s3://[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]/.*$",
@@ -499,6 +504,15 @@ def ssm_commands(cluster, yaml_b64, opts):
     ``AWS-RunShellScript`` -- constraint 1's original motivation. Two commands, because
     constraint 2's 115 s cap is about a single command: the launch is started detached and polled,
     never waited on inline.
+
+    A managed job, not a cluster launch. The controller carries an admin policy that raises on
+    CLUSTER_LAUNCH and CLUSTER_EXEC -- `sky launch` is refused there before any capacity is
+    requested, so the first version of this function could not have launched anything on the
+    controller it was written for. `sky jobs launch` is the accepted entry point, and it takes no
+    `-c` at all: the name below is the *job* name, and SkyPilot derives its own cluster name from
+    it. That also moves REQ-064's teardown into a property of the launch rather than a command
+    somebody has to remember -- a managed job terminates its cluster when the job ends, including
+    when it fails.
     """
     remote_yaml = f"/tmp/lingbot_t2/{cluster}.yaml"
     launch = "\n".join([
@@ -507,23 +521,26 @@ def ssm_commands(cluster, yaml_b64, opts):
         f"echo {yaml_b64} | base64 -d > {remote_yaml}",
         # Detached, so this command returns immediately instead of blocking past the document's
         # timeout while capacity is acquired. -d also asks SkyPilot itself to detach.
-        f"setsid nohup sky launch -c {cluster} -y -d {remote_yaml} "
+        f"setsid nohup sky jobs launch -n {cluster} -y -d {remote_yaml} "
         f"> /tmp/lingbot_t2/{cluster}.launch.log 2>&1 < /dev/null &",
         "sleep 5",
         f"echo started; tail -n 5 /tmp/lingbot_t2/{cluster}.launch.log || true",
     ])
     poll = "\n".join([
         "set -u",
-        f"sky status {cluster} 2>&1 | tail -n 20 || true",
+        # -a so a job that has already finished still shows: for a run this short, the interesting
+        # states (SUCCEEDED, FAILED_NO_RESOURCE) are terminal ones that the default view hides.
+        f"sky jobs queue -a 2>&1 | grep -E 'ID|{cluster}' | head -n 20 || true",
         f"tail -n 40 /tmp/lingbot_t2/{cluster}.launch.log 2>/dev/null || true",
     ])
     down = "\n".join([
         "set -u",
-        # REQ-064: this names the cluster this run created, and nothing else. No
-        # terminate-instances, no delete-volume, no filter that could match a resource this
-        # initiative did not create.
-        f"sky down -y {cluster} 2>&1 | tail -n 20 || true",
-        f"sky status {cluster} 2>&1 | tail -n 5 || true",
+        # REQ-064: this names the job this run created, and nothing else. No terminate-instances,
+        # no delete-volume, no filter that could match a resource this initiative did not create.
+        # `sky jobs cancel -n` is narrower than the `sky down` it replaces -- it can only reach a
+        # job submitted under this name, where a cluster name could in principle be reused.
+        f"sky jobs cancel -n {cluster} -y 2>&1 | tail -n 20 || true",
+        f"sky jobs queue -a 2>&1 | grep -E 'ID|{cluster}' | head -n 10 || true",
     ])
     return {"launch": launch, "poll": poll, "down": down, "remote_yaml": remote_yaml}
 
@@ -535,14 +552,49 @@ def teardown_guard(cluster):
     """REQ-064, as a name check rather than a promise.
 
     'Do not delete or terminate any capacity-allocation resource without explicit user direction'
-    is not satisfiable by a runner that will `sky down` whatever string it is handed. Only names
-    this runner generates are eligible.
+    is not satisfiable by a runner that will cancel whatever string it is handed. Only names this
+    runner generates are eligible.
     """
     if not CLUSTER_RE.match(cluster or ""):
         refuse(f"refusing to tear down {cluster!r}: it is not a name this runner generates "
                "(lingbot-t2-<profile>-<runid>). REQ-064 forbids deleting or terminating anything "
                "this initiative did not create, and a cluster nobody here named is exactly that")
     return True
+
+
+def check_controller(instance_id, region, runner=None):
+    """Refuse a launch at a controller that is not there, and say which fact is wrong.
+
+    Two site values can each be stale in a way ``send-command`` reports identically. The recorded
+    instance may have been replaced -- an instance id is not a durable name for a controller, and
+    the one this runner was written against no longer exists in any state. Or the region may be the
+    job's rather than the controller's, which is the same conflation that used to be in the call
+    below. Both surface as one opaque ``InvalidInstanceId`` after the manifest has already been
+    built, so ask first and name both candidates in the refusal.
+    """
+    runner = runner or (lambda cmd: subprocess.run(cmd, capture_output=True, text=True,
+                                                   timeout=60))
+    proc = runner(["aws", "ssm", "describe-instance-information", "--region", region,
+                   "--filters", f"Key=InstanceIds,Values={instance_id}", "--output", "json"])
+    if proc.returncode != 0:
+        refuse(f"could not ask SSM about controller {instance_id} in {region}: "
+               f"{(proc.stderr or '').strip()[:200]}")
+    try:
+        info = json.loads(proc.stdout)["InstanceInformationList"]
+    except Exception:                                   # noqa: BLE001
+        refuse(f"unreadable describe-instance-information response for {instance_id}")
+    if not info:
+        refuse(f"controller {instance_id} is not an SSM-managed instance in {region}. Either the "
+               "recorded 'controller_instance_id' has been replaced, or 'controller_region' is "
+               "wrong -- it is the region the CONTROLLER runs in, not the region the job launches "
+               "into. Those are different facts and this runner used to have only one field")
+    ping = (info[0] or {}).get("PingStatus")
+    if ping != "Online":
+        refuse(f"controller {instance_id} is {ping!r} to SSM, not Online. send-command would be "
+               "accepted and never delivered, which reads exactly like a launch that quietly did "
+               "nothing")
+    return {"instance_id": instance_id, "region": region, "ping_status": ping,
+            "agent_version": (info[0] or {}).get("AgentVersion")}
 
 
 # --------------------------------------------------------------------------------------------
@@ -772,12 +824,16 @@ def main(argv=None):
     if not site.get("controller_instance_id"):
         refuse("--launch needs site config 'controller_instance_id': SkyPilot runs on the "
                "controller, not on this desk, and the job travels to it over SSM")
+    controller_region = site.get("controller_region") or site["region"]
+    manifest["controller_region"] = controller_region
+    manifest["controller_check"] = check_controller(site["controller_instance_id"],
+                                                   controller_region)
     proc = subprocess.run(
         ["aws", "ssm", "send-command",
          "--instance-ids", site["controller_instance_id"],
          "--document-name", "AWS-RunShellScript",
          "--parameters", json.dumps({"commands": [cmds["launch"]]}),
-         "--region", site["region"], "--output", "json"],
+         "--region", controller_region, "--output", "json"],
         capture_output=True, text=True, timeout=120)
     manifest["launched"] = proc.returncode == 0
     manifest["ssm_send_command_rc"] = proc.returncode
