@@ -46,7 +46,9 @@ kernel instead of the stub. Everything above runs against ``install_cte_stub()``
 makes it desk-runnable and is also the one thing that could make a *compiled* run vacuous — a
 trn2 run that reports the stub's numbers has measured the desk twice. The arm therefore leaves
 ``NeuronAttentionAdapter._load_kernel`` alone, lets the real import happen, and records which
-kernel it got, and it scores that provenance **before** it scores any ``rel_err``. Checks 2 and
+kernel it got **and which device ran it** — the second axis was added 2026-08-17, because
+recording which kernel OBJECT loaded left a cpu-resolved trn2 run passing every provenance guard
+— and it scores that provenance **before** it scores any ``rel_err``. Checks 2 and
 5 above are the two the arm cannot inherit and re-states in its own terms: bit-equality means
 something stronger there (two devices, two reduction orders) and the negative control has to
 come from the INPUT, because the real kernel cannot be asked to ignore ``prior_used_len``. See
@@ -713,6 +715,81 @@ def measure_reference_floor(args) -> int:
 # ------------------------------------------------------------------------------------------
 ARM_REFERENCE_MEMBER = "sdpa_fused"       # the fused GPU member: REQ-021's comparison, staged
 
+# Device types that are NOT a Trainium device. An EXCLUSION list, and the direction is the whole
+# design: an allowlist would have to name the string trn2's torch reports for a Neuron device, and
+# no run in this repository has ever established it -- which is why --device is a parameter rather
+# than a literal in the first place. A wrong literal there fails a run that DID execute on Neuron
+# and blames the port, the same hazard case 14 of the desk suite measured the deep control to
+# avoid. "cpu, cuda and meta are not Trainium" needs no trn2 run to be true and is falsifiable at
+# the desk in both directions, so it is the only form of this guard that cannot cost a spot hour
+# to a guess.
+NON_NEURON_DEVICE_TYPES = ("cpu", "cuda", "meta")
+
+# The three points at which a device is observable, plus the control's. All four are recorded per
+# cell and all four are scored: a partial move -- inputs staged to the device, output materialised
+# on the host, or a control that ran somewhere the measurement did not -- is exactly the case a
+# single witness would miss.
+DEVICE_WITNESSES = ("input_device", "kv_device", "compute_device", "control_device")
+
+
+def _dev(t) -> str:
+    """The device a tensor actually lives on, as a string.
+
+    A one-line function on purpose: it is the seam the desk suite patches so its fake-kernel cases
+    can report an xla device, which lies about the OBSERVATION and leaves ``NON_NEURON_DEVICE_TYPES``
+    shipped exactly as written. A test that widened the tuple instead would delete the guard it is
+    there to exercise.
+    """
+    return str(t.device)
+
+
+def _device_type(name: str) -> str:
+    """The type half of a device string. Total: never raises on an unfamiliar name."""
+    try:
+        return torch.device(name).type
+    except Exception:                                              # noqa: BLE001
+        return str(name).split(":")[0]
+
+
+def _xla_runtime():
+    """``torch_xla.core.xla_model`` if importable, else None. **Never raises.**
+
+    ``bench_streaming.py``'s ``_xla`` raises when torch_xla is absent, which is correct for an
+    explicit ``--device xla`` request and wrong here: this is called above both BLOCKED returns, so
+    an exception would turn the desk's two exit-3 paths into a traceback and delete the only
+    desk-verifiable evidence for the raise-not-fallback property.
+    """
+    try:
+        import torch_xla.core.xla_model as xm                      # noqa: PLC0415
+        return xm
+    except Exception:                                              # noqa: BLE001
+        return None
+
+
+def _resolve_arm_device(requested, cuda_available, xla, env_pjrt):
+    """Which device the arm runs on, as ``(device_string, how_it_was_decided)``.
+
+    Pure and total -- every input is a parameter, nothing is imported here and nothing raises --
+    which is what makes all four branches desk-testable, since torch_xla is installed nowhere in
+    this project and the branch that matters most is the one this desk cannot reach.
+
+    Returns a **string**, never a ``torch.device``: ``_write_arm`` json.dumps the body this value
+    lands in, and ``torch.device`` is not JSON-serialisable, so returning ``xm.xla_device()``
+    directly would raise while writing the artifact -- after the measurement, losing the whole run
+    with nothing on disk.
+    """
+    if requested:
+        return requested, "explicit"
+    if xla is not None and (env_pjrt or "").upper() == "NEURON":
+        try:
+            return str(xla.xla_device()), "xla_runtime"
+        except Exception as exc:                                   # noqa: BLE001
+            return (("cuda" if cuda_available else "cpu"),
+                    f"xla_runtime_present_but_failed: {type(exc).__name__}")
+    if cuda_available:
+        return "cuda", "cuda_visible"
+    return "cpu", "nothing_identified_the_venue"
+
 
 def _kernel_identity(fn) -> dict:
     """Everything observable about the object ``_load_kernel`` returned.
@@ -763,9 +840,19 @@ def _write_arm(args, body: dict, verdict: str, code: int) -> int:
 
 def run_neuron_arm(args) -> int:
     """TASK-N08 owed step 1. Returns the exit code documented in the module docstring."""
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n=== C5 attention parity, NEURON arm (device={device}, H={NUM_HEADS}, "
-          f"D={HEAD_DIM}, mtf={MTF}) ===\n")
+    # Ask the runtime for the device name instead of guessing it, and record how the answer was
+    # reached. This line read `args.device or ("cuda" if cuda else "cpu")`, which on a trn2 host --
+    # no CUDA -- resolved to **cpu**, and nothing downstream scored it: the arm would load the real
+    # nkilib kernel, pass all nine provenance guards, and publish a rel_err from a comparison that
+    # never touched Trainium. Neither half of the fix is sufficient alone. Derivation without a
+    # guard is the silent-landing shape this arm exists to condemn, and a guard without derivation
+    # makes an operator's guess at an unestablished device string the difference between a
+    # measurement and a refusal at $8.5964/hr.
+    xla = _xla_runtime()
+    device, device_resolution = _resolve_arm_device(
+        args.device, torch.cuda.is_available(), xla, os.environ.get("PJRT_DEVICE"))
+    print(f"\n=== C5 attention parity, NEURON arm (device={device} [{device_resolution}], "
+          f"H={NUM_HEADS}, D={HEAD_DIM}, mtf={MTF}) ===\n")
 
     # ---- provenance, scored first ---------------------------------------------------------
     emit("stub_was_never_installed_in_this_process", not STUB_INSTALLS,
@@ -802,7 +889,7 @@ def run_neuron_arm(args) -> int:
            "assert_env_raised": env_why}
     if env_why:
         print(f"  BLOCKED: {env_why}")
-        return _write_arm(args, {"device": device, "env": env, "kernel": None,
+        return _write_arm(args, {"device": device, "device_resolution": device_resolution, "env": env, "kernel": None,
                                  "blocked_because": "neuron_env_not_configured",
                                  "raises_rather_than_falling_back": None,
                                  "raises_note": "null on purpose. This run never reached the "
@@ -831,7 +918,7 @@ def run_neuron_arm(args) -> int:
                     "without the Neuron stack -- a silent fallback is how the stub got into "
                     "every existing figure. Desk-verifiable, since the desk GPU is exactly such "
                     "a host once the two env vars above are exported")
-        return _write_arm(args, {"device": device, "env": env, "kernel": None,
+        return _write_arm(args, {"device": device, "device_resolution": device_resolution, "env": env, "kernel": None,
                                  "blocked_because": "neuron_kernel_unavailable",
                                  "raises_rather_than_falling_back": True},
                           "BLOCKED", 3)
@@ -842,7 +929,7 @@ def run_neuron_arm(args) -> int:
          detail="scored before any rel_err. REQ-086's definition of real hardware is which "
                 "kernel ran, so this is the gate that makes the discrepancy below mean anything")
     if not _under_nkilib(ident):
-        return _write_arm(args, {"device": device, "env": env, "kernel": ident,
+        return _write_arm(args, {"device": device, "device_resolution": device_resolution, "env": env, "kernel": ident,
                                  "raises_rather_than_falling_back": False,
                                  "not_scored_because": "_load_kernel returned an object that is "
                                                        "not under nkilib; no rel_err computed"},
@@ -879,7 +966,7 @@ def run_neuron_arm(args) -> int:
                 "c5_reference_floor_results.json. A run with nothing to compare against is the "
                 "vacuous case and fails here rather than reporting a verdict on nothing")
     if not verified or bad:
-        return _write_arm(args, {"device": device, "env": env, "kernel": ident,
+        return _write_arm(args, {"device": device, "device_resolution": device_resolution, "env": env, "kernel": ident,
                                  "raises_rather_than_falling_back": False,
                                  "not_scored_because": "no verified staged reference"},
                           "FAIL", 1)
@@ -914,14 +1001,22 @@ def run_neuron_arm(args) -> int:
             k_live = blob["inputs"]["k_live"].to(device)
             v_live = blob["inputs"]["v_live"].to(device)
             c5, adapter = build_with_adapter(HEAD_DIM, NUM_HEADS, MTF, device, check_env=True)
+            row["input_device"] = _dev(q)
             replay(c5, k_live, v_live, NUM_HEADS, HEAD_DIM)
             k_seen, v_seen, valid, plan = c5.visible_group(0, 0)
+            # The tensors attend_groups actually hands the kernel, so this is the load-bearing
+            # witness of the three: `device` above is what was requested, this is what happened.
+            row["kv_device"] = _dev(k_seen)
             n = int(valid)
             row["replay_is_bit_exact"] = bool(
                 n == int(k_live.shape[0])
                 and torch.equal(k_seen[:n].cpu(), k_live.cpu())
                 and torch.equal(v_seen[:n].cpu(), v_live.cpu()))
             got = c5.compute_attention(0, 0, q)
+            # BEFORE the .cpu() below, which is the only chance: that call is what makes the
+            # comparison host-side, and after it every tensor here reads "cpu" and the evidence of
+            # where the output materialised is gone.
+            row["compute_device"] = _dev(got)
             # Compared on the host in fp32 so a second device's arithmetic cannot enter the
             # comparison itself.
             row["rel_err"] = rel_err(got.detach().cpu().float(), ref.float())
@@ -951,6 +1046,9 @@ def run_neuron_arm(args) -> int:
                     q[0].permute(1, 0, 2).contiguous(),
                     [(k_seen, v_seen, torch.full_like(valid, int(plan.padded)), plan)])
                 row["control_valid_len"] = int(plan.padded)
+                # The control carries the 100x margin, so a control that quietly ran somewhere
+                # else would score that margin from a device the measurement never used.
+                row["control_device"] = _dev(ctrl)
                 row["control_rel_err"] = rel_err(
                     ctrl.permute(1, 0, 2).unsqueeze(0).detach().cpu().float(), ref.float())
             except Exception as exc:                                       # noqa: BLE001
@@ -976,6 +1074,39 @@ def run_neuron_arm(args) -> int:
          detail="append is a copy, so a replayed prefix that is not bit-equal to the staged "
                 "keys means this run attended something the reference never saw, and the "
                 "rel_err below would be a comparison of two different problems")
+
+    # ---- the venue, SELF-OBSERVED: which device the compared tensors actually lived on ---------
+    # The guards above establish which kernel OBJECT loaded. None of them establishes which DEVICE
+    # ran it, and the artifact recorded `device` as a field -- an echo of the argument, which is a
+    # claim the harness makes about itself and never checks. Same class as _harness_revision
+    # refusing to record a caller-supplied SHA as self_observed_git: `--device` is a caller
+    # assertion, a tensor's own .device is self-observation, and only the second one is evidence.
+    offending = [{"file": c["file"], "frames": c["frames"],
+                  "witnesses": {w: c[w] for w in DEVICE_WITNESSES if w in c},
+                  "disagreeing": [w for w in DEVICE_WITNESSES if w in c
+                                  and _device_type(c[w]) in NON_NEURON_DEVICE_TYPES]}
+                 for c in scored
+                 if [w for w in DEVICE_WITNESSES if w in c
+                     and _device_type(c[w]) in NON_NEURON_DEVICE_TYPES]]
+    emit("compared_tensors_ran_on_a_neuron_device", bool(scored) and not offending,
+         device_requested=args.device, device_resolved=device,
+         device_resolution=device_resolution, xla_runtime_importable=xla is not None,
+         excluded_device_types=list(NON_NEURON_DEVICE_TYPES),
+         witnesses_per_cell=[{"file": c["file"],
+                              **{w: c[w] for w in DEVICE_WITNESSES if w in c}} for c in scored],
+         cells_on_a_non_neuron_device=offending,
+         detail="scored before any rel_err, for the reason the kernel-provenance guards are: a "
+                "discrepancy from an unknown venue misleads rather than under-informs. It reads "
+                "the tensors' own .device, captured inside the loop before the host-side .cpu() "
+                "normalisation erases it, and it excludes rather than requires -- naming the "
+                "string a Trainium device reports would fail a run that DID execute on Neuron, "
+                "which is the one failure direction this arm must not add. IF THE KERNEL "
+                "PROVENANCE GUARDS PASSED AND THESE WITNESSES READ cpu, the finding is that "
+                "device provenance is not observable through Tensor.device on this stack -- "
+                "attention_cte is a GenericKernel handed plain torch tensors, and a baremetal NKI "
+                "path may ship host buffers to the device itself. That is a fact about "
+                "observability and NOT a C5 parity failure; the first run to hit it should record "
+                "it as the fact this repository has never established, not re-derive the bar")
 
     tol = args.tolerance
 
@@ -1074,7 +1205,12 @@ def run_neuron_arm(args) -> int:
                     "and is never used to move the floor -- the value being scored cannot "
                     "re-derive the bar that scores it")
 
-    body = {"device": device, "env": env, "kernel": ident,
+    body = {"device": device, "device_requested": args.device,
+            "device_resolution": device_resolution,
+            "device_observed": sorted({c[w] for c in scored for w in DEVICE_WITNESSES if w in c}),
+            "neuron_device_observed": bool(scored) and not offending,
+            "xla_runtime_importable": xla is not None,
+            "env": env, "kernel": ident,
             "raises_rather_than_falling_back": False,
             "raises_note": "false because the kernel WAS available here, so the property was "
                            "not exercised by this run; it is recorded true by the runs that "
@@ -1147,8 +1283,13 @@ def main() -> int:
     ap.add_argument("--device", default=None,
                     help="device for the Neuron arm. Which string names a Trainium device is "
                          "not established by any run in this repository, so it is a parameter "
-                         "here rather than a guess in the source; defaults to cuda if visible, "
-                         "else cpu, which is what the desk raise-not-fallback check wants")
+                         "here rather than a guess in the source. Omitted, the arm ASKS the "
+                         "runtime -- torch_xla's xla_device() when it is importable and "
+                         "PJRT_DEVICE says NEURON -- and falls back to cuda, else cpu, which is "
+                         "what the desk raise-not-fallback check wants. Supplying it is a caller "
+                         "assertion and buys no provenance: the compared tensors' own .device is "
+                         "scored either way, so --device cpu on a trn2 host FAILS rather than "
+                         "publishing a number")
     args = ap.parse_args()
 
     # Owed step 3 is a measurement, not a check. It writes its own artifact and deliberately

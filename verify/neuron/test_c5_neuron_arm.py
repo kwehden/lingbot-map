@@ -23,13 +23,23 @@ just its passing one. Two properties are the point:
   of the bar. Folding them together made a generous tolerance fail the control guard on a correct
   run -- case 15 is that regression, and it requires the control guard to pass and the bar guard to
   be the single named failure.
+* **Which kernel loaded is not which device ran.** Every guard above scores the kernel OBJECT, and
+  a cpu-resolved trn2 run passed all of them while publishing a rel_err from a comparison that
+  never touched Trainium. Case 16 is that defect reproduced at the desk, and it is the only case
+  whose failing run also measures ~1e-7 and meets its bar: a number can be beautiful and void.
+  Case 17 shows an explicit ``--device`` buys no provenance, 18 that a partial move is caught and
+  named, 19 that with nothing scored the guard does not read PASS, 20 that both BLOCKED paths keep
+  their exact guard counts, and 21 exercises the derivation's four branches without torch_xla.
 
 **Cases 5-10 and 12-15 do NOT constitute a Neuron run and this file must never be cited as one.**
 They register a fake ``nkilib.core.attention`` in ``sys.modules`` so that the real, unpatched
 ``_load_kernel`` import succeeds, which is the only way to reach the staged-reference comparison
 path (sha256 verification, replay, rel_err, control, tolerance scoring, coverage) from the desk.
-What they establish is that the path is correct and its guards discriminate; what runs the arm for
-REQ-028 is trn2 hardware under ``TASK-N14a``, where the kernel is real and this fixture is absent.
+Since 2026-08-17 they also patch ``_dev`` to report ``xla:0``, because this desk is an A10G and
+cuda is not Trainium -- the patch is on the OBSERVATION and never on ``NON_NEURON_DEVICE_TYPES``,
+the threshold, which case 21 re-asserts as shipped. What they establish is that the path is correct
+and its guards discriminate; what runs the arm for REQ-028 is trn2 hardware under ``TASK-N14a``,
+where the kernel is real and both fixtures are absent.
 
 Run in the Tier 1 container (torch cannot be installed on the host)::
 
@@ -205,6 +215,17 @@ sys.modules.update({"nkilib": pkg, "nkilib.core": core, "nkilib.core.attention":
 check("the shipped _load_kernel now resolves it, with no patch of any kind",
       mod.NeuronAttentionAdapter._load_kernel is mod._PRISTINE_LOAD_KERNEL
       and not mod.STUB_INSTALLS)
+
+# The device witnesses have to be faked for the same reason the kernel is: this desk is an A10G, so
+# every tensor below genuinely lives on cuda, and cuda is not Trainium. The patch is on `_dev`, the
+# OBSERVATION, and never on NON_NEURON_DEVICE_TYPES, the THRESHOLD -- widening the tuple would
+# delete the guard these cases are meant to keep exercising. Case 16 runs the same fixture with the
+# real `_dev` and is the case that refuses it; case 21 re-asserts the shipped tuple at the end.
+REAL_DEV = mod._dev
+mod._dev = lambda t: "xla:0"
+check("the observation is patched, not the threshold: the shipped exclusion tuple is untouched",
+      mod.NON_NEURON_DEVICE_TYPES == ("cpu", "cuda", "meta"),
+      str(mod.NON_NEURON_DEVICE_TYPES))
 
 # Two shallow cells only: the comparison path is what is under test, and 1124-frame cells are
 # ~2,250 sequential appends each. Coverage being partial is itself exercised, in case 9.
@@ -481,8 +502,178 @@ check("and it reports the tightest control, which IS the ceiling on any bar N21 
       f"tightest={bar['tightest_control']} forgiven="
       + str([c["frames"] for c in bar["cells_the_bar_would_forgive"]]))
 
+# ---------------------------------------------------------------------------------------
+# Cases 16-20: the device axis. The patch above comes OFF here, so these run against the
+# real `_dev` on the real desk device -- which is the defect's own venue, one letter apart.
+# ---------------------------------------------------------------------------------------
+mod._dev = REAL_DEV
+
+print("\n=== case 16: the reported defect, reproduced -- a real kernel on the wrong device ===")
+# The whole finding in one artifact. Nothing is broken about this run except where it ran: the
+# fake kernel agrees with the staged GPU reference to ~1e-7, the bar is met, every kernel-provenance
+# guard passes -- and on a trn2 host the resolution that produced this device would have been
+# `cpu`, silently, because there is no CUDA there. Before this guard the run exited 0 and the
+# rel_err was quotable. The pairing below IS the defect: a number that agrees beautifully and is
+# void anyway.
+code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
+check("exit 1, not 0", code == 1, f"code={code} verdict={art['verdict']}")
+check("the device guard is the SINGLE named failure -- nothing else about the run is wrong",
+      failing(art) == ["compared_tensors_ran_on_a_neuron_device"], str(failing(art)))
+check("and the parity gate it voids PASSED, on a bar the run genuinely met",
+      art["worst_rel_err"] < 1e-4
+      and next(r for r in art["results"]
+               if r["check"] == "neuron_vs_staged_gpu_reference_within_tolerance")["pass"],
+      f"worst={art['worst_rel_err']:.3e}")
+dg = next(r for r in art["results"] if r["check"] == "compared_tensors_ran_on_a_neuron_device")
+check("it names every cell and which witnesses disagreed",
+      len(dg["cells_on_a_non_neuron_device"]) == 2
+      and all(set(c["disagreeing"]) == {"input_device", "kv_device", "compute_device",
+                                        "control_device"}
+              for c in dg["cells_on_a_non_neuron_device"]),
+      str(dg["cells_on_a_non_neuron_device"][0]["disagreeing"]))
+check("the artifact stops claiming device provenance it does not have",
+      art["neuron_device_observed"] is False and art["device_observed"],
+      f"observed={art['device_observed']} resolution={art['device_resolution']}")
+check("the run's diagnostics all survive the failure -- the cells, controls and rel_errs are "
+      "still on disk, because the guard adds no early return",
+      len(art["cells"]) == 2 and all(c["control_rel_err"] is not None for c in art["cells"]))
+check("and the desk's honest resolution is recorded, not invented",
+      art["device_resolution"] == ("cuda_visible" if CUDA_AT_IMPORT
+                                   else "nothing_identified_the_venue"),
+      art["device_resolution"])
+
+print("\n=== case 17: an explicit --device is a caller assertion, and buys no provenance ===")
+# Why the derivation alone would not have been enough. `--device cpu` on a trn2 host is the
+# operator asserting a venue; the tensors' own .device is the venue observing itself. This arm
+# already refuses a caller-supplied SHA as self_observed_git for the same reason.
+code, art = arm(reference_tensors=shallow, tolerance=measured * 10, device="cpu")
+check("exit 1 even though the caller named the device",
+      code == 1, f"code={code} verdict={art['verdict']}")
+check("the device guard is still the only failure",
+      failing(art) == ["compared_tensors_ran_on_a_neuron_device"], str(failing(art)))
+check("and the artifact separates what was asked for from what was observed",
+      art["device_requested"] == "cpu" and art["device_resolution"] == "explicit"
+      and art["device_observed"] == ["cpu"], str(art["device_observed"]))
+
+print("\n=== case 18: a PARTIAL move is caught, and the disagreeing witness is named ===")
+# The case a single witness misses: inputs staged to the device, output materialised on the host.
+# Only the three-witness design can express it, and the artifact has to say WHICH one disagreed or
+# an operator at $8.5964/hr cannot act on the failure.
+mod._dev = lambda t: "cpu" if t.dtype == torch.float32 and t.dim() == 4 else "xla:0"
+code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
+check("exit 1", code == 1, f"code={code} verdict={art['verdict']}")
+dg = next(r for r in art["results"] if r["check"] == "compared_tensors_ran_on_a_neuron_device")
+check("it fires on a mixture, not just on a uniformly wrong device",
+      not dg["pass"] and all("xla:0" in c["witnesses"].values()
+                             for c in dg["cells_on_a_non_neuron_device"]),
+      str(dg["cells_on_a_non_neuron_device"][0]["witnesses"]))
+check("and only the cpu-side witnesses are blamed",
+      all(set(c["disagreeing"]) < {"input_device", "kv_device", "compute_device",
+                                   "control_device"}
+          for c in dg["cells_on_a_non_neuron_device"]),
+      str(dg["cells_on_a_non_neuron_device"][0]["disagreeing"]))
+mod._dev = lambda t: "xla:0"
+code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
+check("with every witness on the device again, the guard passes and the run is green",
+      code == 0 and failing(art) == [] and art["neuron_device_observed"] is True,
+      f"code={code} {failing(art)}")
+
+print("\n=== case 19: with nothing scored the device guard must not read PASS ===")
+# The anti-vacuity direction every guard in this arm needs: a run with no cells has no evidence
+# about the device either way, and a guard that passes on an absent input is the vacuity this whole
+# file exists to close.
+code, art = arm(reference_tensors=None, tolerance=1e-3)
+check("exit 1, and the device guard is absent rather than passing on nothing",
+      code == 1 and not [r for r in art["results"]
+                         if r["check"] == "compared_tensors_ran_on_a_neuron_device"],
+      str([r["check"] for r in art["results"]]))
+tampered_only = tempfile.mkdtemp()
+code, art = arm(reference_tensors=tampered_only, tolerance=1e-3)
+check("same for an empty staged directory: no cells, no device claim",
+      code == 1 and not [r for r in art["results"]
+                         if r["check"] == "compared_tensors_ran_on_a_neuron_device"],
+      f"code={code}")
+
+print("\n=== case 20: the two BLOCKED paths are untouched, which is the placement tripwire ===")
+# The guard sits after all five early returns. If it ever migrates above them, these counts move
+# and the desk says so -- rather than trn2 saying it at $8.5964/hr. Case 1 already pins the
+# env-unset path at 2; this pins the other one, which the reported defect's fix could have broken.
+mod._dev = REAL_DEV
+saved = dict(sys.modules)
+for name in ("nkilib", "nkilib.core", "nkilib.core.attention"):
+    sys.modules.pop(name, None)
+code, art = arm(reference_tensors=shallow, tolerance=measured * 10)
+check("no Neuron stack still BLOCKS at exit 3, not a device failure",
+      code == 3 and art["blocked_because"] == "neuron_kernel_unavailable",
+      f"code={code} {art.get('blocked_because')}")
+check("exactly the four provenance guards ran: nothing new leaked above the import",
+      art["n_checks"] == 4 and failing(art) == [], f"{art['n_checks']} checks {failing(art)}")
+check("and the device guard is not among them",
+      not [r for r in art["results"] if r["check"] == "compared_tensors_ran_on_a_neuron_device"])
+check("the blocked artifact still records how the device WOULD have been resolved",
+      "device_resolution" in art, str(art.get("device_resolution")))
+set_env(False)
+code, art = arm()
+check("env unset still BLOCKS with exactly two guards, as case 1 requires",
+      code == 3 and art["n_checks"] == 2
+      and art["blocked_because"] == "neuron_env_not_configured",
+      f"code={code} {art['n_checks']} checks")
+set_env(True)
+sys.modules.update(saved)
+
+print("\n=== case 21: the derivation, all four branches, without torch_xla installed ===")
+# The half of the fix this desk could otherwise never exercise. `_resolve_arm_device` is pure and
+# total precisely so its xla branch is testable here: torch_xla is installed nowhere in this
+# project, so a derivation that reached for it inside the function would be desk-unprovable and
+# would first run on the instance that costs money.
+xm_ok = types.SimpleNamespace(xla_device=lambda: torch.device("xla:0"))
+xm_bad = types.SimpleNamespace(xla_device=lambda: (_ for _ in ()).throw(RuntimeError("no plugin")))
+check("an explicit request wins, and is labelled as the caller's",
+      mod._resolve_arm_device("trn2:0", True, xm_ok, "NEURON") == ("trn2:0", "explicit"))
+check("with a live runtime and PJRT_DEVICE=NEURON it ASKS instead of guessing",
+      mod._resolve_arm_device(None, False, xm_ok, "NEURON") == ("xla:0", "xla_runtime"))
+check("and returns a STRING -- a torch.device would raise while writing the artifact, after "
+      "the measurement",
+      isinstance(mod._resolve_arm_device(None, False, xm_ok, "NEURON")[0], str))
+dev, why = mod._resolve_arm_device(None, False, xm_bad, "NEURON")
+check("a runtime present but unusable falls back and SAYS so, rather than raising",
+      dev == "cpu" and why.startswith("xla_runtime_present_but_failed"), f"{dev} {why}")
+check("no torch_xla: the desk resolves cuda exactly as before, so both BLOCKED paths are safe",
+      mod._resolve_arm_device(None, True, None, "NEURON") == ("cuda", "cuda_visible"))
+check("and the trn2 defect's own shape is now NAMED rather than silent",
+      mod._resolve_arm_device(None, False, None, "NEURON")
+      == ("cpu", "nothing_identified_the_venue"))
+check("_xla_runtime never raises on a host without torch_xla",
+      mod._xla_runtime() is None)
+check("the exclusion tuple shipped is still cpu/cuda/meta after every patch above",
+      mod.NON_NEURON_DEVICE_TYPES == ("cpu", "cuda", "meta")
+      and mod._dev is REAL_DEV, str(mod.NON_NEURON_DEVICE_TYPES))
+armsrc2 = open(HARNESS).read().split("def run_neuron_arm")[1].split("def main()")[0]
+check("the guard scores the tensors' devices, not the argument",
+      "_device_type(c[w]) in NON_NEURON_DEVICE_TYPES" in armsrc2
+      and "compared_tensors_ran_on_a_neuron_device" in armsrc2)
+check("and it is an exclusion, with no allowlist literal naming one acceptable Trainium string",
+      '== "xla"' not in armsrc2 and 'type == "trn' not in armsrc2)
+check("the device witnesses are captured before the .cpu() that erases them",
+      armsrc2.index('row["compute_device"]') < armsrc2.index('got.detach().cpu().float()'))
+# A unit-tested helper the production path does not call is precisely the vacuity this file exists
+# to catch, and it was reachable here: reverting the resolution at the top of the arm to the old
+# `args.device or ("cuda" if cuda else "cpu")` left every check above green, because the checks
+# exercised the helper directly and nothing pinned the call site. Found by mutation, 2026-08-17.
+armfn2 = next(n for n in ast.walk(ast.parse(open(HARNESS).read()))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_neuron_arm")
+armcalls = {n.func.id for n in ast.walk(armfn2)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+check("the arm RESOLVES THROUGH the helper rather than inlining the rule",
+      {"_resolve_arm_device", "_xla_runtime"} <= armcalls, str(sorted(armcalls)))
+check("and the silent cpu default is gone from the arm's own source",
+      'or ("cuda" if torch.cuda.is_available() else "cpu")' not in armsrc2)
+check("the witnesses are read through the seam, so patching _dev really does reach the guard",
+      armsrc2.count("_dev(") == len(mod.DEVICE_WITNESSES), str(armsrc2.count("_dev(")))
+
 set_env(False)
 print(f"\n===== {'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)} "
       f"({len(FAILS)} failed)")
-print("      Cases 5-10 and 12-15 used a fake nkilib and are NOT evidence of a Neuron run.\n")
+print("      Cases 5-10 and 12-15 used a fake nkilib AND a patched _dev reporting xla:0, and are\n"
+      "      NOT evidence of a Neuron run. Cases 16-21 run against the real _dev on this desk.\n")
 raise SystemExit(1 if FAILS else 0)
